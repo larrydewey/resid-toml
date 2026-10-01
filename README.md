@@ -1,7 +1,7 @@
 # resid-toml
 
 [TOML](https://toml.io/) as a format for
-[resid-serial](../resid-serial), the serialization framework.
+[resid-serial](https://github.com/larrydewey/resid-serial), the serialization framework.
 
 | File | What it is |
 |---|---|
