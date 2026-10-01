@@ -1,0 +1,37 @@
+ok   grammar/no value
+ok   grammar/no equals
+ok   grammar/bare word
+ok   grammar/newline in string
+ok   grammar/unclosed table
+ok   grammar/unclosed inline
+ok   grammar/unclosed array
+ok   grammar/empty key
+ok   grammar/no header key
+ok   duplicate/key
+ok   duplicate/dotted
+ok   duplicate/in a table
+ok   duplicate/root and table
+ok   redefine/table as array
+ok   redefine/array as table
+ok   redefine/key as table
+ok   range/int too big
+ok   range/int too small
+ok   range/hex too big
+ok   field/missing
+ok   field/one of two
+ok   type/int for text
+ok   type/array for int
+ok   type/table for int
+ok   type/scalar for table
+ok   variant/no type
+ok   variant/unknown
+ok   variant/type not text
+ok   variant/not a table
+ok   variant/payload
+ok   variant/unit
+ok   option/absent
+ok   option/wrong type
+ok   option/array wrong item
+ok   end/one document
+ok   end/empty document
+exit 0

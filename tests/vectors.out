@@ -1,0 +1,76 @@
+ok   key/bare
+ok   key/quoted
+ok   key/literal
+ok   key/dotted
+ok   key/dotted table
+ok   comment/end
+ok   comment/own line
+ok   comment/after table
+ok   table/one
+ok   table/nested
+ok   table/dotted header
+ok   table/quoted header
+ok   table/out of order
+ok   table/shared
+ok   array of tables/one
+ok   array of tables/two
+ok   array of tables/nested
+ok   array of tables/under table
+ok   array/empty
+ok   array/ints
+ok   array/mixed
+ok   array/nested
+ok   array/trailing comma
+ok   array/newlines
+ok   array/of tables
+ok   inline/empty
+ok   inline/one
+ok   inline/keys
+ok   inline/trailing comma
+ok   inline/nested
+ok   inline/array
+ok   string/basic
+ok   string/empty
+ok   string/escapes
+ok   string/quote
+ok   string/backslash
+ok   string/unicode
+ok   string/literal
+ok   string/literal quotes
+ok   string/multiline
+ok   string/multiline first newline
+ok   string/multiline keeps spaces
+ok   string/multiline literal
+ok   string/continuation
+ok   int/zero
+ok   int/plus
+ok   int/minus
+ok   int/underscores
+ok   int/hex
+ok   int/octal
+ok   int/binary
+ok   int/hex negative
+ok   int/max
+ok   int/too big
+ok   float/whole
+ok   float/frac
+ok   float/exponent
+ok   float/small exponent
+ok   float/underscores
+ok   float/plus
+ok   float/inf
+ok   float/negative inf
+ok   float/nan
+ok   bool/true
+ok   bool/false
+ok   date/offset
+ok   date/space
+ok   date/only
+ok   time/offset
+ok   write/struct
+ok   write/nested
+ok   write/kinds
+ok   write/keys quoted
+ok   write/whole float
+ok   write/empty list
+exit 0

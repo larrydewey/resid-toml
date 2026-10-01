@@ -1,0 +1,1105 @@
+// parse.resid — TOML's text grammar, parsed into a tree.
+//
+// The whole document is parsed before anything is decoded, so a decoder
+// navigates a table rather than a stream: a key may be written before or
+// after the table it belongs to, a dotted key may reach into one, and a
+// field may be asked for by name in any order.
+//
+// Values are kept in the form the text gave them, so nothing is lost on the
+// way in: a date-time is a string, since the data model has no date, and
+// an integer stays an integer rather than becoming a float.
+
+import "../../resid-serial/src/serial.resid";
+import "text.resid";
+
+// ─── Small helpers ───────────────────────────────────────────────────
+
+pub Bool at_char(Str in, Int i, Int c) { return i >= 0 && i < str_len(in) && str_char_at(in, i) == c; }
+
+Bool word_at(Str in, Int i, Str w) { return word_from(in, i, w, 0); }
+
+Bool word_from(Str in, Int i, Str w, Int k) {
+    if (k >= str_len(w)) { return true; }
+    if (i + k >= str_len(in)) { return false; }
+    if (str_char_at(in, i + k) != str_char_at(w, k)) { return false; }
+    return word_from(in, i, w, k + 1);
+}
+
+Bool digits_at(Str in, Int i, Int n) { return digits_from(in, i, n, 0); }
+
+Bool digits_from(Str in, Int i, Int n, Int seen) {
+    if (seen >= n) { return true; }
+    if (i + seen >= str_len(in)) { return false; }
+    if (!tm_is_digit(str_char_at(in, i + seen))) { return false; }
+    return digits_from(in, i, n, seen + 1);
+}
+
+// ─── The tree ────────────────────────────────────────────────────────
+
+// A value as TOML holds it. Every payload is a record, so a value is a sum
+// the compiler can destructure.
+type TomlValue = TStr(TomlText) | TInt(TomlInt) | TReal(TomlReal) | TBool(TomlBool) | TArr(TomlArr) | TTable(TomlTable);
+
+type TomlText = { Str s; };
+type TomlInt = { Int n; };
+type TomlReal = { Float n; };
+type TomlBool = { Bool b; };
+type TomlArr = { List(TomlValue) items; };
+
+// A table, in the order the document wrote it. A record rather than a bare
+// list, so that a value can carry one as a sum payload.
+type TomlTable = { List(TomlPair) pairs; Bool inline; };
+type TomlPair = { Str key; TomlValue value; };
+
+pub TomlTable tm_empty() { return TomlTable {.pairs = [], .inline = false}; }
+
+// A table written inside braces, which is a value rather than a section.
+pub TomlTable tm_inline_of(TomlTable t) { return TomlTable {.pairs = t.pairs, .inline = true}; }
+
+pub Bool tm_is_table(TomlValue v) { return match v { TTable(_) => true, _ => false }; }
+
+pub Bool tm_is_array(TomlValue v) { return match v { TArr(_) => true, _ => false }; }
+
+pub Bool tm_is_text(TomlValue v) { return match v { TStr(_) => true, _ => false }; }
+
+// The index of a key in a table, or -1.
+pub Int tm_find(TomlTable t, Str key, Int i, Int found) {
+    if (i >= t.pairs.len()) { return found; }
+    if (t.pairs[i].key == key) { return i; }
+    return tm_find(t, key, i + 1, found);
+}
+
+pub TomlValue tm_at(TomlTable t, Int i) {
+    if (i >= t.pairs.len()) { return TTable(tm_empty()); }
+    return t.pairs[i].value;
+}
+
+pub Str tm_key_at(TomlTable t, Int i) {
+    if (i >= t.pairs.len()) { return ""; }
+    return t.pairs[i].key;
+}
+
+pub TomlTable tm_append(TomlTable t, TomlPair p) { return TomlTable {.pairs = t.pairs.concat([p]), .inline = t.inline}; }
+
+// The table with the pair at index k replaced by p.
+pub TomlTable tm_replace(TomlTable t, Int k, TomlPair p) { return tm_replace_from(t, 0, k, p); }
+
+TomlTable tm_replace_from(TomlTable t, Int i, Int k, TomlPair p) {
+    if (i >= t.pairs.len()) { return t; }
+    if (i == k) { return TomlTable {.pairs = t.pairs[0..i].concat([p]).concat(t.pairs[i + 1..t.pairs.len()]), .inline = t.inline}; }
+    TomlTable rest = TomlTable {.pairs = t.pairs[i + 1..t.pairs.len()], .inline = t.inline};
+    return TomlTable {.pairs = t.pairs[0..i].concat([t.pairs[i]]).concat(tm_replace_from(rest, 0, k - i - 1, p).pairs), .inline = t.inline};
+}
+
+// What a value holds, read out of the sum.
+pub Str tm_text(TomlValue v) {
+    TomlText empty = TomlText {.s = ""};
+    TomlText got = match v { TStr(x) => x, _ => empty };
+    return got.s;
+}
+
+pub Int tm_int(TomlValue v) {
+    TomlInt empty = TomlInt {.n = 0};
+    TomlInt got = match v { TInt(x) => x, _ => empty };
+    return got.n;
+}
+
+pub Float tm_real(TomlValue v) {
+    TomlReal empty = TomlReal {.n = 0.0};
+    TomlReal got = match v { TReal(x) => x, _ => empty };
+    return got.n;
+}
+
+pub Bool tm_flag(TomlValue v) {
+    TomlBool empty = TomlBool {.b = false};
+    TomlBool got = match v { TBool(x) => x, _ => empty };
+    return got.b;
+}
+
+pub List(TomlValue) tm_items(TomlValue v) {
+    List(TomlValue) empty = [];
+    TomlArr got = match v { TArr(x) => x, _ => TomlArr {.items = empty} };
+    return got.items;
+}
+
+pub TomlTable tm_table(TomlValue v) { return match v { TTable(x) => x, _ => tm_empty() }; }
+
+// What a value is, for an error message.
+pub Str tm_kind(TomlValue v) {
+    return match v {
+        TStr(_) => "a string",
+        TInt(_) => "an integer",
+        TReal(_) => "a float",
+        TBool(_) => "a boolean",
+        TArr(_) => "an array",
+        TTable(_) => "a table"
+    };
+}
+
+// ─── Paths ───────────────────────────────────────────────────────────
+
+// A path into the document: a key, or a position in an array of tables.
+// A path segment: a name, an index into an array, or a name inside a table
+// written in braces. The last is a key that renders as a value, which is
+// how a variant's `type` and `value` reach the document.
+type TomlSeg = TgKey(TomlText) | TgIdx(TomlInt) | TgInline(TomlText);
+
+pub TomlSeg seg_key(Str k) { return TgKey(TomlText {.s = k}); }
+
+pub TomlSeg seg_inline(Str k) { return TgInline(TomlText {.s = k}); }
+
+pub TomlSeg seg_idx(Int i) { return TgIdx(TomlInt {.n = i}); }
+
+pub Bool seg_is_key(TomlSeg s) { return match s { TgKey(_) => true, TgInline(_) => true, _ => false }; }
+
+pub Bool seg_is_inline(TomlSeg s) { return match s { TgInline(_) => true, _ => false }; }
+
+pub Str seg_text(TomlSeg s) {
+    TomlText empty = TomlText {.s = ""};
+    TomlText got = match s { TgKey(k) => k, TgInline(k) => k, _ => empty };
+    return got.s;
+}
+
+pub Int seg_pos(TomlSeg s) {
+    TomlInt empty = TomlInt {.n = 0};
+    TomlInt got = match s { TgIdx(n) => n, _ => empty };
+    return got.n;
+}
+
+List(TomlSeg) toml_segs(List(Str) path, Int i, List(TomlSeg) acc) {
+    if (i >= path.len()) { return acc; }
+    return toml_segs(path, i + 1, acc.concat([seg_key(path[i])]));
+}
+
+// The path without its last segment.
+List(TomlSeg) toml_head(List(TomlSeg) segs, Int i, List(TomlSeg) acc) {
+    if (i + 1 >= segs.len()) { return acc; }
+    return toml_head(segs, i + 1, acc.concat([segs[i]]));
+}
+
+// ─── The document ────────────────────────────────────────────────────
+
+// A whole TOML document: a table of key-value pairs and tables. The prefix
+// is where the pairs being read belong, which a `[table]` header moves.
+pub Result(TomlTable, SerialError) toml_parse(Str in) {
+    Result(Parsed(TomlTable, Int), SerialError) r = toml_document(in, 0, tm_empty(), []);
+    if (Ok(x) = r) { return toml_finish(in, x.rest, x.value); }
+    if (Err(e) = r) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+// Nothing but whitespace and comments may follow the last pair.
+Result(TomlTable, SerialError) toml_finish(Str in, Int i, TomlTable table) {
+    Int i1 = tm_blank(in, i);
+    if (i1 >= str_len(in)) { return Ok(table); }
+    return Err(syntax_error("expected a newline or the end of the document at " + f"{i1}"));
+}
+
+Result(Parsed(TomlTable, Int), SerialError) toml_document(Str in, Int i, TomlTable tree, List(TomlSeg) prefix) {
+    Int i1 = tm_blank(in, i);
+    if (i1 >= str_len(in)) { return parsed(tree, i1); }
+    if (str_char_at(in, i1) == 91) { return toml_header(in, i1, tree, prefix); }
+    return toml_pair(in, i1, tree, prefix);
+}
+
+// Whitespace, newlines and comments, in any order: what separates
+// statements.
+pub Int tm_blank(Str in, Int i) { return tm_blank_at(in, i, str_len(in)); }
+
+Int tm_blank_at(Str in, Int i, Int n) {
+    if (i >= n) { return i; }
+    Int c = str_char_at(in, i);
+    if (tm_is_space(c) || tm_is_newline(c) || c == 13) { return tm_blank_at(in, i + 1, n); }
+    if (c == 35) { return tm_blank_at(in, tm_comment(in, i + 1, n), n); }
+    return i;
+}
+
+Int tm_comment(Str in, Int i, Int n) {
+    if (i >= n) { return n; }
+    if (tm_is_newline(str_char_at(in, i))) { return i; }
+    return tm_comment(in, i + 1, n);
+}
+
+// Spaces and tabs, which may sit inside a line but not between its parts.
+pub Int tm_space(Str in, Int i) { return tm_space_at(in, i, str_len(in)); }
+
+Int tm_space_at(Str in, Int i, Int n) {
+    if (i >= n) { return i; }
+    if (tm_is_space(str_char_at(in, i))) { return tm_space_at(in, i + 1, n); }
+    return i;
+}
+
+// ─── Walking and putting ─────────────────────────────────────────────
+
+// The table at a path, created on the way. A key names a table, or an
+// array of tables when an index follows it; an index names one of that
+// array's tables.
+Result(TomlTable, SerialError) toml_step(TomlTable tree, List(TomlSeg) segs, Int i) { return toml_step_to(tree, segs, i, segs.len()); }
+
+// The same walk, stopping before segment `stop`, so that a key which is not
+// the last one of a longer path still counts as having more path to come.
+Result(TomlTable, SerialError) toml_step_to(TomlTable tree, List(TomlSeg) segs, Int i, Int stop) {
+    if (i >= stop) { return Ok(tree); }
+    Int n = segs.len();
+    if (!seg_is_key(segs[i])) { return toml_step_to(tm_table(toml_at_index(tree, seg_pos(segs[i]))), segs, i + 1, stop); }
+    if (i + 1 < n && !seg_is_key(segs[i + 1])) {
+        Result(TomlTable, SerialError) arr = toml_open_array(tree, seg_text(segs[i]));
+        if (Err(e) = arr) { return Err(e); }
+        if (Ok(t) = arr) { return toml_step_item(t, seg_pos(segs[i + 1]), segs, i + 2, stop); }
+        return Err(custom_error("unreachable"));
+    }
+    // A key that names an array of tables, with more path to come, means
+    // the newest table of that array: a reference to an array of tables
+    // always points at the last element defined.
+    if (i + 1 < n) {
+        Int at = tm_find(tree, seg_text(segs[i]), 0, -1);
+        if (at >= 0 && tm_is_array(tm_at(tree, at))) { return toml_step_last(tree, at, segs, i + 1, stop); }
+    }
+    Result(TomlTable, SerialError) sub = toml_sub(tree, seg_text(segs[i]));
+    if (Err(e) = sub) { return Err(e); }
+    if (Ok(t) = sub) { return toml_step_to(t, segs, i + 1, stop); }
+    return Err(custom_error("unreachable"));
+}
+
+// The newest table of an array of tables, and the rest of the path.
+Result(TomlTable, SerialError) toml_step_last(TomlTable tree, Int k, List(TomlSeg) segs, Int i, Int stop) {
+    List(TomlValue) items = tm_items(tm_at(tree, k));
+    if (items.len() == 0) { return Err(syntax_error("`" + tm_key_at(tree, k) + "` has no tables yet")); }
+    return toml_step_to(tm_table(items[items.len() - 1]), segs, i, stop);
+}
+
+// The indexed table of an array of tables, and the rest of the path.
+Result(TomlTable, SerialError) toml_step_item(TomlTable tree, Int idx, List(TomlSeg) segs, Int i, Int stop) {
+    List(TomlValue) items = tm_items(tm_at(tree, tree.pairs.len() - 1));
+    if (idx < 0 || idx >= items.len()) { return Err(syntax_error("no table at that index")); }
+    return toml_step_to(tm_table(items[idx]), segs, i, stop);
+}
+
+// The table a key names, created if it is not there: the *table below*
+// the key, which a put writes into.
+Result(TomlTable, SerialError) toml_sub(TomlTable tree, Str key) {
+    Int k = tm_find(tree, key, 0, -1);
+    if (k < 0) { return Ok(tm_empty()); }
+    if (!tm_is_table(tm_at(tree, k))) { return Err(syntax_error("`" + key + "` is already a value, not a table")); }
+    return Ok(tm_table(tm_at(tree, k)));
+}
+
+// A table header's key, with the empty table it names: the tree keeps its
+// own pairs, and the pairs after the header go into that table.
+Result(TomlTable, SerialError) toml_add_key(TomlTable tree, Str key) {
+    Int k = tm_find(tree, key, 0, -1);
+    if (k < 0) { return Ok(tm_append(tree, TomlPair {.key = key, .value = TTable(tm_empty())})); }
+    if (!tm_is_table(tm_at(tree, k))) { return Err(syntax_error("`" + key + "` is already a value, not a table")); }
+    return Ok(tree);
+}
+
+// The array of tables a key names, created if it is not there.
+Result(TomlTable, SerialError) toml_open_array(TomlTable tree, Str key) {
+    Int k = tm_find(tree, key, 0, -1);
+    if (k < 0) { return Ok(tm_append(tree, TomlPair {.key = key, .value = TArr(TomlArr {.items = [TTable(tm_empty())]})})); }
+    if (!tm_is_array(tm_at(tree, k))) { return Err(syntax_error("`" + key + "` is already a value, not an array of tables")); }
+    return Ok(tree);
+}
+
+// The table at an index of the array the last pair holds.
+TomlValue toml_at_index(TomlTable tree, Int i) {
+    if (tree.pairs.len() == 0) { return TTable(tm_empty()); }
+    List(TomlValue) items = tm_items(tm_at(tree, tree.pairs.len() - 1));
+    if (i < 0 || i >= items.len()) { return TTable(tm_empty()); }
+    return items[i];
+}
+
+// A pair put where its path leads: the tables along the way are created,
+// and the tree is rebuilt from the inside out, so the rest of the document
+// survives a pair written deep inside it.
+Result(TomlTable, SerialError) toml_put(TomlTable tree, List(TomlSeg) prefix, List(TomlSeg) key, TomlValue v) {
+    if (key.len() == 0) { return Err(syntax_error("a pair needs a key")); }
+    return toml_put_at(tree, prefix.concat(key), 0, v);
+}
+
+Result(TomlTable, SerialError) toml_put_at(TomlTable tree, List(TomlSeg) path, Int i, TomlValue v) { return toml_put_from(tree, path, i, v, 0 - 1); }
+
+// The pair an index segment at `i` belongs to, which the segment before it
+// named.
+Result(TomlTable, SerialError) toml_put_from(TomlTable tree, List(TomlSeg) path, Int i, TomlValue v, Int at) {
+    if (i >= path.len()) { return Ok(tree); }
+    if (!seg_is_key(path[i])) { return toml_put_index(tree, path, i, at, v); }
+    Str key = seg_text(path[i]);
+    if (i + 1 >= path.len()) { return toml_put_leaf(tree, path[i], v); }
+    if (!seg_is_key(path[i + 1])) { return toml_put_array(tree, path, i, key, v); }
+    // A key that names an array of tables, with more path to come, means
+    // the newest table of that array: that is where a reference to an
+    // array of tables always points.
+    Int arr = tm_find(tree, key, 0, -1);
+    if (arr >= 0 && tm_is_array(tm_at(tree, arr))) {
+        List(TomlValue) items = tm_items(tm_at(tree, arr));
+        if (items.len() == 0) { return Err(syntax_error("`" + key + "` has no tables yet")); }
+        Result(TomlTable, SerialError) inner = toml_put_from(tm_table(items[items.len() - 1]), path, i + 1, v, 0 - 1);
+        if (Err(e) = inner) { return Err(e); }
+        if (Ok(t) = inner) { return Ok(toml_last_of(tree, arr, t)); }
+        return Err(custom_error("unreachable"));
+    }
+    Result(TomlTable, SerialError) sub = toml_sub(tree, key);
+    if (Err(e) = sub) { return Err(e); }
+    if (Ok(t) = sub) {
+        Result(TomlTable, SerialError) inner = toml_put_from(t, path, i + 1, v, 0 - 1);
+        if (Err(e2) = inner) { return Err(e2); }
+        if (Ok(t2) = inner) { return toml_put_rebuild(tree, t, path[i], t2); }
+        return Err(custom_error("unreachable"));
+    }
+    return Err(custom_error("unreachable"));
+}
+
+// An index into the array of tables the pair at k holds: the value goes
+// into that element, which is replaced with the result.
+Result(TomlTable, SerialError) toml_put_index(TomlTable tree, List(TomlSeg) path, Int i, Int k, TomlValue v) {
+    if (k < 0) { return Err(syntax_error("an array of tables needs a key")); }
+    Int idx = seg_pos(path[i]);
+    List(TomlValue) items = tm_items(tm_at(tree, k));
+    if (idx < 0 || idx >= items.len()) { return Err(syntax_error("no table at that index")); }
+    Result(TomlTable, SerialError) inner = toml_put_from(tm_table(items[idx]), path, i + 1, v, 0 - 1);
+    if (Err(e) = inner) { return Err(e); }
+    if (Ok(t) = inner) { return toml_replace_index(tree, k, t); }
+    return Err(custom_error("unreachable"));
+}
+
+// A key that names an array of tables, with the rest of the path inside
+// one of its elements.
+Result(TomlTable, SerialError) toml_put_array(TomlTable tree, List(TomlSeg) path, Int i, Str key, TomlValue v) {
+    Result(TomlTable, SerialError) arr = toml_open_array(tree, key);
+    if (Err(e) = arr) { return Err(e); }
+    if (Ok(t) = arr) { return toml_put_from(t, path, i + 1, v, tm_find(t, key, 0, -1)); }
+    return Err(custom_error("unreachable"));
+}
+
+// The table the segment names, with the table below it inside. A key whose
+// value is an array of tables keeps it one: only its newest table changed.
+Result(TomlTable, SerialError) toml_put_rebuild(TomlTable tree, TomlTable sub, TomlSeg seg, TomlTable inner) {
+    if (!seg_is_key(seg)) { return toml_replace_index(tree, tree.pairs.len() - 1, inner); }
+    Str key = seg_text(seg);
+    Int k = tm_find(tree, key, 0, -1);
+    if (k < 0) { return Ok(tm_append(tree, TomlPair {.key = key, .value = TTable(inner)})); }
+    if (tm_is_array(tm_at(tree, k))) { return toml_replace_index(tree, k, inner); }
+    return Ok(tm_replace(tree, k, TomlPair {.key = key, .value = TTable(inner)}));
+}
+
+// The last segment takes the value: a key that is already there is an
+// error, and an index means the newest table of an array of tables.
+Result(TomlTable, SerialError) toml_put_leaf(TomlTable tree, TomlSeg seg, TomlValue v) {
+    if (!seg_is_key(seg)) { return toml_replace_index(tree, tree.pairs.len() - 1, tm_table(v)); }
+    Str key = seg_text(seg);
+    if (tm_find(tree, key, 0, -1) >= 0) { return Err(syntax_error("`" + key + "` is defined twice")); }
+    return Ok(tm_append(tree, TomlPair {.key = key, .value = v}));
+}
+
+// The newest table of an array of tables, with sub in it: where the pairs
+// after a `[[a]]` header go.
+Result(TomlTable, SerialError) toml_replace_index(TomlTable tree, Int k, TomlTable sub) {
+    if (k < 0) { return Err(syntax_error("an array of tables needs a key")); }
+    return Ok(toml_last_of(tree, k, sub));
+}
+
+// The pair at k holds an array of tables: its newest table is `sub`.
+TomlTable toml_last_of(TomlTable tree, Int k, TomlTable sub) {
+    Str key = tm_key_at(tree, k);
+    List(TomlValue) items = tm_items(tm_at(tree, k));
+    if (items.len() == 0) { return tree; }
+    List(TomlValue) fresh = toml_set_index(items, items.len() - 1, TTable(sub));
+    return tm_replace(tree, k, TomlPair {.key = key, .value = TArr(TomlArr {.items = fresh})});
+}
+
+// The table at an index of the array the pair at k holds.
+Result(TomlTable, SerialError) toml_step_index(TomlTable tree, TomlSeg seg) {
+    if (!seg_is_key(seg)) { return Err(syntax_error("a key where an index belongs")); }
+    return toml_replace_index(tree, tm_find(tree, seg_text(seg), 0, -1), tm_table(toml_at_index(tree, seg_pos(seg))));
+}
+
+List(TomlValue) toml_set_index(List(TomlValue) items, Int i, TomlValue v) { return toml_set_index_at(items, 0, i, v); }
+
+List(TomlValue) toml_set_index_at(List(TomlValue) items, Int at, Int i, TomlValue v) {
+    if (at >= items.len()) { return items; }
+    if (at == i) { return items[0..at].concat([v]).concat(items[at + 1..items.len()]); }
+    return items[0..at].concat([items[at]]).concat(toml_set_index_at(items[at + 1..items.len()], 0, i - at - 1, v));
+}
+
+// ─── Tables ──────────────────────────────────────────────────────────
+
+// A `[a.b]` header opens the table at the path; a `[[a.b]]` header adds a
+// table to the array there, and the pairs after it go inside that one.
+type TomlOpen = { TomlTable tree; List(TomlSeg) prefix; };
+
+Result(Parsed(TomlTable, Int), SerialError) toml_header(Str in, Int i, TomlTable tree, List(TomlSeg) prefix) {
+    Bool array = at_char(in, i + 1, 91);
+    Int j = tm_space(in, i + (if (array) { 2 } else { 1 }));
+    Result(Parsed(List(Str), Int), SerialError) path = toml_key_path(in, j);
+    if (Ok(p) = path) { return toml_header_close(in, p.rest, p.value, array, tree, prefix); }
+    if (Err(e) = path) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+Result(Parsed(TomlTable, Int), SerialError) toml_header_close(Str in, Int i, List(Str) path, Bool array, TomlTable tree, List(TomlSeg) prefix) {
+    Int k = tm_space(in, i);
+    if (array) {
+        if (!at_char(in, k, 93) || !at_char(in, k + 1, 93)) { return Err(syntax_error("expected ]] at " + f"{k}")); }
+        return toml_header_open(in, k + 2, path, true, tree, prefix);
+    }
+    if (!at_char(in, k, 93)) { return Err(syntax_error("expected ] at " + f"{k}")); }
+    return toml_header_open(in, k + 1, path, false, tree, prefix);
+}
+
+Result(Parsed(TomlTable, Int), SerialError) toml_header_open(Str in, Int k, List(Str) path, Bool array, TomlTable tree, List(TomlSeg) prefix) {
+    Int eol = tm_space(in, k);
+    Result(TomlOpen, SerialError) next = toml_open(tree, prefix, path, array);
+    if (Ok(o) = next) { return toml_document(in, eol, o.tree, o.prefix); }
+    if (Err(e) = next) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+// A header's path is from the document root, not from the table the pairs
+// before it belong to, so `[a.b]` after `[[c]]` still means a.b. The tree
+// is rebuilt from the inside out, so a header under a table that already
+// has pairs keeps them.
+Result(TomlOpen, SerialError) toml_open(TomlTable tree, List(TomlSeg) unused, List(Str) path, Bool array) {
+    if (path.len() == 0) { return Err(syntax_error("a table header needs a key")); }
+    List(TomlSeg) segs = toml_segs(path, 0, []);
+    Int last = segs.len() - 1;
+    // The index the header's own table will have in the array of tables it
+    // opens, which the pairs after it are written under.
+    Int at = toml_array_count(tree, segs, 0, 0);
+    Result(TomlTable, SerialError) made = toml_header_at(tree, segs, 0, array);
+    if (Err(e) = made) { return Err(e); }
+    if (Ok(t) = made) {
+        if (!array) { return Ok(TomlOpen {.tree = t, .prefix = segs}); }
+        return Ok(TomlOpen {.tree = t, .prefix = segs.concat([seg_idx(at)])});
+    }
+    return Err(custom_error("unreachable"));
+}
+
+// How many tables the array the path leads to already holds, which is the
+// index the header's own table takes.
+Int toml_array_count(TomlTable tree, List(TomlSeg) segs, Int i, Int found) {
+    if (i >= segs.len()) { return found; }
+    Int at = tm_find(tree, seg_text(segs[i]), 0, -1);
+    if (at < 0) { return found; }
+    if (tm_is_array(tm_at(tree, at))) {
+        if (i + 1 >= segs.len()) { return tm_items(tm_at(tree, at)).len(); }
+        List(TomlValue) items = tm_items(tm_at(tree, at));
+        if (items.len() == 0) { return found; }
+        return toml_array_count(tm_table(items[items.len() - 1]), segs, i + 1, found);
+    }
+    if (!tm_is_table(tm_at(tree, at))) { return found; }
+    return toml_array_count(tm_table(tm_at(tree, at)), segs, i + 1, found);
+}
+
+// The table the segment names, created when it is not there: the last
+// segment is the table the header opens, and the ones before it are the
+// tables it lives in. A segment that names an array of tables leads to its
+// newest element, since that is where a header below it belongs.
+Result(TomlTable, SerialError) toml_header_at(TomlTable tree, List(TomlSeg) segs, Int i, Bool array) {
+    if (i >= segs.len()) { return Ok(tree); }
+    Str key = seg_text(segs[i]);
+    if (i + 1 >= segs.len()) { return toml_header_last(tree, key, array); }
+    Int at = tm_find(tree, key, 0, -1);
+    if (at >= 0 && tm_is_array(tm_at(tree, at))) {
+        List(TomlValue) items = tm_items(tm_at(tree, at));
+        if (items.len() == 0) { return Err(syntax_error("`" + key + "` has no tables yet")); }
+        TomlTable newest = tm_table(items[items.len() - 1]);
+        Result(TomlTable, SerialError) sub = toml_header_at(newest, segs, i + 1, array);
+        if (Err(e) = sub) { return Err(e); }
+        if (Ok(t) = sub) { return Ok(toml_header_back(tree, key, at, t)); }
+        return Err(custom_error("unreachable"));
+    }
+    if (at >= 0 && !tm_is_table(tm_at(tree, at))) { return Err(syntax_error("`" + key + "` is already a value, not a table")); }
+    TomlTable below = if (at < 0) { tm_empty() } else { tm_table(tm_at(tree, at)) };
+    Result(TomlTable, SerialError) sub = toml_header_at(below, segs, i + 1, array);
+    if (Err(e) = sub) { return Err(e); }
+    if (Ok(t) = sub) { return Ok(toml_header_back(tree, key, at, t)); }
+    return Err(custom_error("unreachable"));
+}
+
+// The table below a header's segment, with `inner` in it.
+TomlTable toml_header_back(TomlTable tree, Str key, Int at, TomlTable inner) {
+    if (at < 0) { return tm_append(tree, TomlPair {.key = key, .value = TTable(inner)}); }
+    if (tm_is_array(tm_at(tree, at))) { return toml_last_of(tree, at, inner); }
+    return tm_replace(tree, at, TomlPair {.key = key, .value = TTable(inner)});
+}
+
+// The table the header itself names: a `[a]` reopens the table that is
+// there, and a `[[a]]` adds a table to the array of them.
+Result(TomlTable, SerialError) toml_header_last(TomlTable tree, Str key, Bool array) {
+    Int at = tm_find(tree, key, 0, -1);
+    if (array) {
+        if (at < 0) { return Ok(tm_append(tree, TomlPair {.key = key, .value = TArr(TomlArr {.items = [TTable(tm_empty())]})})); }
+        if (!tm_is_array(tm_at(tree, at))) { return Err(syntax_error("`" + key + "` is already a value, not an array of tables")); }
+        List(TomlValue) items = tm_items(tm_at(tree, at));
+        List(TomlValue) grown = items.concat([TTable(tm_empty())]);
+        return Ok(tm_replace(tree, at, TomlPair {.key = key, .value = TArr(TomlArr {.items = grown})}));
+    }
+    if (at < 0) { return Ok(tm_append(tree, TomlPair {.key = key, .value = TTable(tm_empty())})); }
+    if (!tm_is_table(tm_at(tree, at))) { return Err(syntax_error("`" + key + "` is already a value, not a table")); }
+    return Ok(tree);
+}
+
+// ─── Key-value pairs ─────────────────────────────────────────────────
+
+// `key.path = value`, put where its path leads.
+Result(Parsed(TomlTable, Int), SerialError) toml_pair(Str in, Int i, TomlTable tree, List(TomlSeg) prefix) {
+    Result(Parsed(List(Str), Int), SerialError) path = toml_key_path(in, i);
+    if (Ok(p) = path) { return toml_pair_eq(in, p.rest, p.value, tree, prefix); }
+    if (Err(e) = path) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+Result(Parsed(TomlTable, Int), SerialError) toml_pair_eq(Str in, Int i, List(Str) path, TomlTable tree, List(TomlSeg) prefix) {
+    Int j = tm_space(in, i);
+    if (!at_char(in, j, 61)) { return Err(syntax_error("expected = at " + f"{j}")); }
+    Result(Parsed(TomlValue, Int), SerialError) v = toml_value(in, tm_space(in, j + 1));
+    if (Ok(x) = v) { return toml_pair_put(in, x.rest, prefix, toml_segs(path, 0, []), x.value, tree); }
+    if (Err(e) = v) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+Result(Parsed(TomlTable, Int), SerialError) toml_pair_put(Str in, Int i, List(TomlSeg) prefix, List(TomlSeg) path, TomlValue v, TomlTable tree) {
+    Result(TomlTable, SerialError) next = toml_put(tree, prefix, path, v);
+    if (Ok(t) = next) { return toml_document(in, toml_after_value(in, i), t, prefix); }
+    if (Err(e) = next) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+// Nothing but a comment may follow a value on its line.
+Int toml_after_value(Str in, Int i) {
+    Int j = tm_space(in, i);
+    if (j >= str_len(in)) { return j; }
+    if (tm_is_newline(str_char_at(in, j))) { return j; }
+    if (str_char_at(in, j) == 35) { return tm_comment(in, j, str_len(in)); }
+    return j;
+}
+
+// ─── Keys ────────────────────────────────────────────────────────────
+
+// A dotted key: `a`, `"b c"`, `a.b`, `"a.b".c`.
+Result(Parsed(List(Str), Int), SerialError) toml_key_path(Str in, Int i) { return toml_key_path_at(in, i, []); }
+
+Result(Parsed(List(Str), Int), SerialError) toml_key_path_at(Str in, Int i, List(Str) acc) {
+    Result(Parsed(Str, Int), SerialError) k = toml_key(in, i);
+    if (Ok(x) = k) {
+        Int j = tm_space(in, x.rest);
+        if (at_char(in, j, 46)) { return toml_key_path_at(in, j + 1, acc.concat([x.value])); }
+        return parsed(acc.concat([x.value]), j);
+    }
+    if (Err(e) = k) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+// One key segment: bare, a basic string, or a literal string.
+Result(Parsed(Str, Int), SerialError) toml_key(Str in, Int i) {
+    if (i >= str_len(in)) { return Err(syntax_error("expected a key at " + f"{i}")); }
+    Int c = str_char_at(in, i);
+    if (c == 34) { return toml_basic_text(in, i); }
+    if (c == 39) { return toml_literal_text(in, i); }
+    if (!tm_is_bare_key(c)) { return Err(syntax_error("expected a key at " + f"{i}")); }
+    return toml_bare_key(in, i, StrBuf());
+}
+
+// The key's text, gathered in one builder rather than a fresh string per
+// character.
+Result(Parsed(Str, Int), SerialError) toml_bare_key(Str in, Int i, StrBuf b) {
+    if (i >= str_len(in)) { return parsed(b.finish(), i); }
+    if (!tm_is_bare_key(str_char_at(in, i))) { return parsed(b.finish(), i); }
+    return toml_bare_key(in, i + 1, b.push_char(str_char_at(in, i)));
+}
+
+// ─── Values ──────────────────────────────────────────────────────────
+
+Result(Parsed(TomlValue, Int), SerialError) toml_value(Str in, Int i) {
+    if (i >= str_len(in)) { return Err(syntax_error("expected a value")); }
+    Int c = str_char_at(in, i);
+    if (c == 34) { return toml_basic_string(in, i); }
+    if (c == 39) { return toml_literal_string(in, i); }
+    if (c == 91) { return toml_array(in, i); }
+    if (c == 123) { return toml_inline_table(in, i); }
+    if (c == 116) { return toml_word(in, i, "true", TBool(TomlBool {.b = true}), 4); }
+    if (c == 102) { return toml_word(in, i, "false", TBool(TomlBool {.b = false}), 5); }
+    return toml_number(in, i);
+}
+
+Result(Parsed(TomlValue, Int), SerialError) toml_word(Str in, Int i, Str w, TomlValue v, Int len) {
+    if (!word_at(in, i, w)) { return Err(syntax_error("expected " + w + " at " + f"{i}")); }
+    return parsed(v, i + len);
+}
+
+Result(Parsed(TomlValue, Int), SerialError) toml_number(Str in, Int i) {
+    Int sign = if (at_char(in, i, 43)) { 1 } else { if (at_char(in, i, 45)) { 0 - 1 } else { 0 } };
+    Int j = i + (if (sign == 0) { 0 } else { 1 });
+    if (word_at(in, j, "inf")) { return toml_special(in, j + 3, sign, true); }
+    if (word_at(in, j, "nan")) { return toml_special(in, j + 3, sign, false); }
+    if (at_char(in, j, 48) && j + 1 < str_len(in)) {
+        Int k = str_char_at(in, j + 1);
+        if (k == 120 || k == 111 || k == 98) { return toml_radix(in, i, j + 2, k, sign); }
+    }
+    if (digits_at(in, j, 4) && at_char(in, j + 4, 45)) { return toml_date(in, i); }
+    if (digits_at(in, j, 2) && at_char(in, j + 2, 58)) { return toml_time(in, j); }
+    return toml_decimal(in, i, j, sign);
+}
+
+// `inf` and `nan`: a float, signed where TOML signs them.
+Result(Parsed(TomlValue, Int), SerialError) toml_special(Str in, Int end, Int sign, Bool inf) {
+    Float f = if (inf) { if (sign < 0) { tm_neg_inf() } else { tm_pos_inf() } } else { tm_nan() };
+    return parsed(TReal(TomlReal {.n = f}), end);
+}
+
+Float tm_pos_inf() { Float z = 0.0; return 1.0 / z; }
+Float tm_neg_inf() { Float z = 0.0; return 0.0 - (1.0 / z); }
+Float tm_nan() { Float z = 0.0; return z / z; }
+
+// 0x, 0o or 0b with the digits that base allows, underscores between them.
+Result(Parsed(TomlValue, Int), SerialError) toml_radix(Str in, Int from, Int j, Int base, Int sign) {
+    Int end = toml_radix_end(in, j, base);
+    if (end == j) { return Err(syntax_error("expected digits in the number at " + f"{j}")); }
+    Int radix = if (base == 120) { 16 } else { if (base == 111) { 8 } else { 2 } };
+    Int(128) acc = toml_radix_value(in, j, end, radix, i128(0));
+    if (!toml_fits(sign, acc)) { return Err(toml_too_big(str_slice(in, from, end))); }
+    return parsed(TInt(TomlInt {.n = toml_int(sign, acc)}), end);
+}
+
+// Where a run of digits in the given base ends; a base of 16 takes the
+// letters a-f, and underscores may sit between digits.
+Int toml_radix_end(Str in, Int i, Int base) {
+    if (i >= str_len(in)) { return i; }
+    Int c = str_char_at(in, i);
+    if (c == 95) { return toml_radix_end(in, i + 1, base); }
+    if (toml_digit_of(c) < 0 || toml_digit_of(c) >= base) { return i; }
+    return toml_radix_end(in, i + 1, base);
+}
+
+// What a character is worth in a base, or -1 when it is not a digit of it.
+Int toml_digit_of(Int c) {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0 - 1;
+}
+
+Int(128) toml_radix_value(Str in, Int i, Int end, Int base, Int(128) acc) {
+    if (i >= end) { return acc; }
+    Int c = str_char_at(in, i);
+    if (c == 95) { return toml_radix_value(in, i + 1, end, base, acc); }
+    return toml_radix_value(in, i + 1, end, base, acc * (Int(128))base + (Int(128))toml_digit_of(c));
+}
+
+// A magnitude as a TOML integer, signed. A TOML integer is 64 bits, so the
+// caller asks toml_fits first.
+Int toml_int(Int sign, Int(128) acc) { return (Int)toml_int128(sign, acc); }
+
+Int(128) toml_int128(Int sign, Int(128) acc) {
+    return if (sign < 0) { i128(0) - acc } else { acc };
+}
+
+// Whether a signed magnitude is inside the 64 bits a TOML integer has.
+Bool toml_fits(Int sign, Int(128) acc) {
+    Int(128) v = toml_int128(sign, acc);
+    Int(128) low = i128(0) - i128(9223372036854775807) - i128(1);
+    return !(v > i128(9223372036854775807) || v < low);
+}
+
+SerialError toml_too_big(Str text) { return invalid_value(text, "a TOML integer, which is 64 bits"); }
+
+// A decimal integer or float, with underscores between the digits.
+Result(Parsed(TomlValue, Int), SerialError) toml_decimal(Str in, Int from, Int j, Int sign) {
+    Int span = toml_skip_digits(in, j);
+    if (span == j) { return Err(syntax_error("expected a value at " + f"{j}")); }
+    Int k = toml_frac_end(in, span);
+    Int e = toml_exp_end(in, k);
+    if (k == span && e == k) {
+        Int(128) acc = toml_acc128(in, j, span, i128(0));
+        if (!toml_fits(sign, acc)) { return Err(toml_too_big(str_slice(in, from, e))); }
+        return parsed(TInt(TomlInt {.n = toml_int(sign, acc)}), e);
+    }
+    Int frac = if (k > span) { k - span - 1 } else { 0 };
+    Float f = toml_decimal_float(in, j, k, e, frac, 0.0);
+    return parsed(TReal(TomlReal {.n = if (sign < 0) { 0.0 - f } else { f }}), e);
+}
+
+// The value of a decimal float: the digits as a mantissa, scaled by the
+// fraction's length and shifted by the exponent.
+Float toml_decimal_float(Str in, Int j, Int k, Int e, Int frac, Float acc) {
+    Float m = toml_mantissa(in, j, k, acc);
+    Float scaled = if (frac > 0) { m / tm_pow10(frac) } else { m };
+    if (e > k + 1) { return toml_scale_exp(in, k + 1, e, scaled, 0); }
+    return scaled;
+}
+
+// The digits of a mantissa, with the underscores and the point skipped.
+Float toml_mantissa(Str in, Int i, Int end, Float acc) {
+    if (i >= end) { return acc; }
+    Int c = str_char_at(in, i);
+    if (c == 95 || c == 46) { return toml_mantissa(in, i + 1, end, acc); }
+    return toml_mantissa(in, i + 1, end, acc * 10.0 + (Float)(c - 48));
+}
+
+Float tm_pow10(Int n) { return tm_pow10_at(n, 1.0); }
+
+Float tm_pow10_at(Int n, Float acc) {
+    if (n <= 0) { return acc; }
+    return tm_pow10_at(n - 1, acc * 10.0);
+}
+
+// The exponent: `e10`, `E+2`, `e-3`.
+Float toml_scale_exp(Str in, Int i, Int end, Float m, Int sign) {
+    if (i >= end) { return m; }
+    Int c = str_char_at(in, i);
+    if (c == 43 || c == 45) { return toml_scale_exp(in, i + 1, end, m, if (c == 43) { 1 } else { 0 - 1 }); }
+    Int span = toml_skip_digits(in, i);
+    if (span == i) { return m; }
+    return toml_pow(m, toml_digits_int(in, i, span), sign);
+}
+
+Float toml_pow(Float m, Int power, Int sign) {
+    if (power <= 0) { return m; }
+    if (sign < 0) { return toml_pow(m / 10.0, power - 1, sign); }
+    return toml_pow(m * 10.0, power - 1, sign);
+}
+
+Int toml_digits_int(Str in, Int i, Int end) { return toml_digits_int_at(in, i, end, 0); }
+
+Int toml_digits_int_at(Str in, Int i, Int end, Int acc) {
+    if (i >= end) { return acc; }
+    Int c = str_char_at(in, i);
+    if (c == 95) { return toml_digits_int_at(in, i + 1, end, acc); }
+    return toml_digits_int_at(in, i + 1, end, acc * 10 + (c - 48));
+}
+
+Int(128) toml_acc128(Str in, Int i, Int end, Int(128) acc) {
+    if (i >= end) { return acc; }
+    Int c = str_char_at(in, i);
+    if (c == 95) { return toml_acc128(in, i + 1, end, acc); }
+    return toml_acc128(in, i + 1, end, acc * (Int(128))10 + (Int(128))(c - 48));
+}
+
+// Where a run of digits ends, underscores included.
+Int toml_skip_digits(Str in, Int i) { return toml_skip_digits_at(in, i, str_len(in)); }
+
+Int toml_skip_digits_at(Str in, Int i, Int n) {
+    if (i >= n) { return i; }
+    Int c = str_char_at(in, i);
+    if (tm_is_digit(c) || c == 95) { return toml_skip_digits_at(in, i + 1, n); }
+    return i;
+}
+
+// Where a fraction ends: a '.' with at least one digit after it.
+Int toml_frac_end(Str in, Int i) {
+    if (!at_char(in, i, 46)) { return i; }
+    if (toml_skip_digits(in, i + 1) == i + 1) { return i; }
+    return toml_skip_digits(in, i + 1);
+}
+
+// Where an exponent ends: `e` or `E`, a sign, and at least one digit.
+Int toml_exp_end(Str in, Int i) {
+    if (i >= str_len(in)) { return i; }
+    Int c = str_char_at(in, i);
+    if (c != 101 && c != 69) { return i; }
+    Int j = toml_exp_sign(in, i + 1);
+    if (toml_skip_digits(in, j) == j) { return i; }
+    return toml_skip_digits(in, j);
+}
+
+Int toml_exp_sign(Str in, Int i) {
+    if (i < str_len(in) && (str_char_at(in, i) == 43 || str_char_at(in, i) == 45)) { return i + 1; }
+    return i;
+}
+
+// ─── Dates and times ─────────────────────────────────────────────────
+
+// A date, a date and a time, or a date with an offset. TOML calls them
+// values of their own; the data model has no date, so the text is kept as a
+// string and reads back the same.
+Result(Parsed(TomlValue, Int), SerialError) toml_date(Str in, Int i) {
+    Int k = toml_skip_digits(in, i + 4);
+    if (!at_char(in, k, 45)) { return Err(syntax_error("expected - in the date at " + f"{k}")); }
+    Int m = toml_skip_digits(in, k + 1);
+    if (!at_char(in, m, 45)) { return Err(syntax_error("expected - in the date at " + f"{m}")); }
+    return toml_date_time(in, i, toml_skip_digits(in, m + 1));
+}
+
+// A time after the date: `T` or a space, the time, and an offset.
+Result(Parsed(TomlValue, Int), SerialError) toml_date_time(Str in, Int i, Int o) {
+    if (o >= str_len(in)) { return toml_date_text(in, i, o); }
+    Int c = str_char_at(in, o);
+    if (c != 84 && c != 116 && c != 32) { return toml_date_text(in, i, o); }
+    Result(Parsed(TomlValue, Int), SerialError) t = toml_time(in, o + 1);
+    if (Ok(x) = t) { return toml_offset(in, i, x.rest); }
+    if (Err(e) = t) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+// `Z`, `+hh:mm` or `-hh:mm` after a time.
+Result(Parsed(TomlValue, Int), SerialError) toml_offset(Str in, Int i, Int j) {
+    if (j >= str_len(in)) { return toml_date_text(in, i, j); }
+    Int c = str_char_at(in, j);
+    if (c == 90 || c == 122) { return toml_date_text(in, i, j + 1); }
+    if (c == 43 || c == 45) { return toml_offset_hours(in, i, toml_skip_digits(in, j + 1)); }
+    return toml_date_text(in, i, j);
+}
+
+// The `hh:mm` of an offset, whose colon has to be there.
+Result(Parsed(TomlValue, Int), SerialError) toml_offset_hours(Str in, Int i, Int h) {
+    if (!at_char(in, h, 58)) { return toml_date_text(in, i, h); }
+    return toml_date_text(in, i, toml_skip_digits(in, h + 1));
+}
+
+// A local time: `hh:mm:ss`, with a fraction of a second.
+Result(Parsed(TomlValue, Int), SerialError) toml_time(Str in, Int i) {
+    if (!digits_at(in, i, 2) || !at_char(in, i + 2, 58)) { return Err(syntax_error("expected a time at " + f"{i}")); }
+    Int j = toml_skip_digits(in, i + 3);
+    if (!at_char(in, j, 58)) { return Err(syntax_error("expected : in the time at " + f"{j}")); }
+    Int k = toml_skip_digits(in, j + 1);
+    return toml_offset(in, i, toml_frac_end(in, k));
+}
+
+Result(Parsed(TomlValue, Int), SerialError) toml_date_text(Str in, Int i, Int end) {
+    return parsed(TStr(TomlText {.s = str_slice(in, i, end)}), end);
+}
+
+// ─── Strings ─────────────────────────────────────────────────────────
+
+// A basic string, or a multi-line one when three quotes open it.
+//
+// The check is its own walk and the build follows it: what is wrong with a
+// string does not depend on the text being built, and a builder cannot cross
+// a Result.
+Result(Parsed(TomlValue, Int), SerialError) toml_basic_string(Str in, Int i) {
+    Bool wide = at_char(in, i + 1, 34) && at_char(in, i + 2, 34);
+    Int from = if (wide) { toml_first_newline(in, i + 3) } else { i + 1 };
+    Result(Int, SerialError) end = toml_basic_ok(in, from, wide);
+    if (Err(e) = end) { return Err(e); }
+    if (Ok(stop) = end) {
+        Str text = toml_basic_text_of(in, from, wide);
+        return parsed(TStr(TomlText {.s = text}), stop);
+    }
+    return Err(custom_error("unreachable"));
+}
+
+// The text of a basic string that has been checked, gathered in one builder.
+Str toml_basic_text_of(Str in, Int i, Bool multi) {
+    return toml_basic_build(in, i, multi, StrBuf()).finish();
+}
+
+// A basic string used as a key: the text, without the quotes.
+Result(Parsed(Str, Int), SerialError) toml_basic_text(Str in, Int i) {
+    Result(Parsed(TomlValue, Int), SerialError) v = toml_basic_string(in, i);
+    if (Ok(x) = v) { return parsed(tm_text(x.value), x.rest); }
+    if (Err(e) = v) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+// A basic string: escapes, and no newline unless it ends the line.
+//
+// The check is its own walk and the build follows it. What is wrong with a
+// string does not depend on the text being built, and a builder cannot cross
+// a Result.
+Result(Int, SerialError) toml_basic_ok(Str in, Int i, Bool multi) {
+    if (i >= str_len(in)) { return Err(eof_error("a closing quote")); }
+    Int c = str_char_at(in, i);
+    if (c == 34) {
+        if (!multi) { return Ok(i + 1); }
+        if (at_char(in, i + 1, 34) && at_char(in, i + 2, 34)) { return Ok(i + 3); }
+        return toml_basic_ok(in, i + 1, true);
+    }
+    if (c == 92) { return toml_escape_ok(in, i + 1, multi); }
+    if (c == 10 && !multi) { return Err(syntax_error("a newline in a string at " + f"{i}")); }
+    return toml_basic_ok(in, i + 1, multi);
+}
+
+// One escape, and the rest of the string after it.
+Result(Int, SerialError) toml_escape_ok(Str in, Int i, Bool multi) {
+    if (i >= str_len(in)) { return Err(eof_error("an escape")); }
+    Int c = str_char_at(in, i);
+    if (c == 98) { return toml_basic_ok(in, i + 1, multi); }
+    if (c == 116) { return toml_basic_ok(in, i + 1, multi); }
+    if (c == 110) { return toml_basic_ok(in, i + 1, multi); }
+    if (c == 102) { return toml_basic_ok(in, i + 1, multi); }
+    if (c == 114) { return toml_basic_ok(in, i + 1, multi); }
+    if (c == 34) { return toml_basic_ok(in, i + 1, multi); }
+    if (c == 92) { return toml_basic_ok(in, i + 1, multi); }
+    if (c == 117) { return toml_unicode_ok(in, i + 1, 4); }
+    if (c == 85) { return toml_unicode_ok(in, i + 1, 8); }
+    if (multi && (tm_is_newline(c) || tm_is_space(c))) { return toml_line_ok(in, i); }
+    return Err(syntax_error("unknown escape at " + f"{i}"));
+}
+
+// A backslash before a newline: the newline and the indentation after it go.
+Result(Int, SerialError) toml_line_ok(Str in, Int i) {
+    Int j = tm_space(in, i);
+    if (j >= str_len(in) || !tm_is_newline(str_char_at(in, j))) { return toml_basic_ok(in, j, true); }
+    return toml_basic_ok(in, tm_space(in, j + 1), true);
+}
+
+// \uXXXX or \UXXXXXXXX, which has to spell a code point.
+Result(Int, SerialError) toml_unicode_ok(Str in, Int i, Int width) {
+    Int cp = toml_hex_cp(in, i, width, 0, 0);
+    if (cp < 0) { return Err(syntax_error("expected " + f"{width}" + " hex digits at " + f"{i}")); }
+    if (cp > 1114111 || (cp >= 55296 && cp <= 57343)) { return Err(syntax_error("\\u is not a code point at " + f"{i}")); }
+    return toml_basic_ok(in, i + width, true);
+}
+
+// The build, which cannot fail: the check has been over it already.
+StrBuf toml_basic_build(Str in, Int i, Bool multi, StrBuf b) {
+    if (i >= str_len(in)) { return b; }
+    Int c = str_char_at(in, i);
+    if (c == 34) {
+        if (!multi) { return b; }
+        if (at_char(in, i + 1, 34) && at_char(in, i + 2, 34)) { return b; }
+        return toml_basic_build(in, i + 1, true, b.push_char(34));
+    }
+    if (c == 92) {
+        Int e = str_char_at(in, i + 1);
+        if (multi && (tm_is_newline(e) || tm_is_space(e))) { return toml_line_build(in, i + 1, b); }
+        return toml_escape_build(in, i + 1, multi, b);
+    }
+    return toml_basic_build(in, i + 1, multi, b.push_char(c));
+}
+
+StrBuf toml_escape_build(Str in, Int i, Bool multi, StrBuf b) {
+    Int c = str_char_at(in, i);
+    if (c == 98) { return toml_basic_build(in, i + 1, multi, b.push_char(8)); }
+    if (c == 116) { return toml_basic_build(in, i + 1, multi, b.push_char(9)); }
+    if (c == 110) { return toml_basic_build(in, i + 1, multi, b.push_char(10)); }
+    if (c == 102) { return toml_basic_build(in, i + 1, multi, b.push_char(12)); }
+    if (c == 114) { return toml_basic_build(in, i + 1, multi, b.push_char(13)); }
+    if (c == 34) { return toml_basic_build(in, i + 1, multi, b.push_char(34)); }
+    if (c == 92) { return toml_basic_build(in, i + 1, multi, b.push_char(92)); }
+    Int width = if (c == 117) { 4 } else { 8 };
+    return toml_basic_build(in, i + width, multi, b.push_char(toml_hex_cp(in, i, width, 0, 0)));
+}
+
+// The line-ending backslash a multi-line string trims: the build skips it.
+StrBuf toml_line_build(Str in, Int i, StrBuf b) {
+    Int j = tm_space(in, i);
+    if (j >= str_len(in) || !tm_is_newline(str_char_at(in, j))) { return toml_basic_build(in, j, true, b); }
+    return toml_basic_build(in, tm_space(in, j + 1), true, b);
+}
+
+Int toml_hex_cp(Str in, Int i, Int width, Int seen, Int acc) {
+    if (seen >= width) { return acc; }
+    if (i >= str_len(in)) { return 0 - 1; }
+    Int c = str_char_at(in, i);
+    if (!tm_is_hex(c)) { return 0 - 1; }
+    return toml_hex_cp(in, i + 1, width, seen + 1, acc * 16 + tm_hex_value(c));
+}
+
+// A literal string: no escapes at all.
+Result(Parsed(TomlValue, Int), SerialError) toml_literal_string(Str in, Int i) {
+    Bool wide = at_char(in, i + 1, 39) && at_char(in, i + 2, 39);
+    Int from = if (wide) { toml_first_newline(in, i + 3) } else { i + 1 };
+    Result(Int, SerialError) end = toml_literal_ok(in, from, wide);
+    if (Err(e) = end) { return Err(e); }
+    if (Ok(stop) = end) {
+        Str text = toml_literal_build(in, from, wide, StrBuf()).finish();
+        return parsed(TStr(TomlText {.s = text}), stop);
+    }
+    return Err(custom_error("unreachable"));
+}
+
+Result(Parsed(Str, Int), SerialError) toml_literal_text(Str in, Int i) {
+    Result(Parsed(TomlValue, Int), SerialError) v = toml_literal_string(in, i);
+    if (Ok(x) = v) { return parsed(tm_text(x.value), x.rest); }
+    if (Err(e) = v) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+// A literal string, checked and then built: no escapes at all, and one
+// quote written twice.
+Result(Int, SerialError) toml_literal_ok(Str in, Int i, Bool multi) {
+    if (i >= str_len(in)) { return Err(eof_error("a closing quote")); }
+    Int c = str_char_at(in, i);
+    if (c == 39) {
+        if (!multi) { return Ok(i + 1); }
+        if (at_char(in, i + 1, 39) && at_char(in, i + 2, 39)) { return Ok(i + 3); }
+        return toml_literal_ok(in, i + 1, true);
+    }
+    if (c == 10 && !multi) { return Err(syntax_error("a newline in a string at " + f"{i}")); }
+    return toml_literal_ok(in, i + 1, multi);
+}
+
+StrBuf toml_literal_build(Str in, Int i, Bool multi, StrBuf b) {
+    if (i >= str_len(in)) { return b; }
+    Int c = str_char_at(in, i);
+    if (c == 39) {
+        if (!multi) { return b; }
+        if (at_char(in, i + 1, 39) && at_char(in, i + 2, 39)) { return b; }
+        return toml_literal_build(in, i + 1, true, b.push_char(39));
+    }
+    return toml_literal_build(in, i + 1, multi, b.push_char(c));
+}
+
+// A newline right after the opening quotes is not part of the string.
+Int toml_first_newline(Str in, Int i) {
+    if (i < str_len(in) && tm_is_newline(str_char_at(in, i))) { return i + 1; }
+    if (i + 1 < str_len(in) && str_char_at(in, i) == 13 && tm_is_newline(str_char_at(in, i + 1))) { return i + 2; }
+    return i;
+}
+
+// ─── Arrays ──────────────────────────────────────────────────────────
+
+// An array: values separated by commas, newlines and comments allowed
+// between them, and a trailing comma.
+Result(Parsed(TomlValue, Int), SerialError) toml_array(Str in, Int i) { return toml_array_at(in, i + 1, []); }
+
+Result(Parsed(TomlValue, Int), SerialError) toml_array_at(Str in, Int i, List(TomlValue) acc) {
+    Int j = tm_blank(in, i);
+    if (j >= str_len(in)) { return Err(eof_error("a closing bracket")); }
+    if (str_char_at(in, j) == 93) { return parsed(TArr(TomlArr {.items = acc}), j + 1); }
+    Result(Parsed(TomlValue, Int), SerialError) v = toml_value(in, j);
+    if (Ok(x) = v) { return toml_array_next(in, x.rest, acc.concat([x.value])); }
+    if (Err(e) = v) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+Result(Parsed(TomlValue, Int), SerialError) toml_array_next(Str in, Int i, List(TomlValue) acc) {
+    Int k = tm_blank(in, i);
+    if (at_char(in, k, 93)) { return parsed(TArr(TomlArr {.items = acc}), k + 1); }
+    if (!at_char(in, k, 44)) { return Err(syntax_error("expected , or ] at " + f"{k}")); }
+    return toml_array_at(in, k + 1, acc);
+}
+
+// ─── Inline tables ───────────────────────────────────────────────────
+
+// An inline table: pairs inside braces, on one line.
+Result(Parsed(TomlValue, Int), SerialError) toml_inline_table(Str in, Int i) { return toml_inline_at(in, i + 1, tm_empty()); }
+
+Result(Parsed(TomlValue, Int), SerialError) toml_inline_at(Str in, Int i, TomlTable acc) {
+    Int j = tm_space(in, i);
+    if (j >= str_len(in)) { return Err(eof_error("a closing brace")); }
+    if (str_char_at(in, j) == 125) { return parsed(TTable(tm_inline_of(acc)), j + 1); }
+    return toml_inline_pair(in, j, acc);
+}
+
+Result(Parsed(TomlValue, Int), SerialError) toml_inline_pair(Str in, Int i, TomlTable acc) {
+    Result(Parsed(List(Str), Int), SerialError) path = toml_key_path(in, i);
+    if (Ok(p) = path) { return toml_inline_eq(in, p.rest, p.value, acc); }
+    if (Err(e) = path) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+Result(Parsed(TomlValue, Int), SerialError) toml_inline_eq(Str in, Int i, List(Str) path, TomlTable acc) {
+    Int k = tm_space(in, i);
+    if (!at_char(in, k, 61)) { return Err(syntax_error("expected = at " + f"{k}")); }
+    Result(Parsed(TomlValue, Int), SerialError) v = toml_value(in, tm_space(in, k + 1));
+    if (Ok(x) = v) { return toml_inline_put(in, x.rest, path, x.value, acc); }
+    if (Err(e) = v) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+Result(Parsed(TomlValue, Int), SerialError) toml_inline_put(Str in, Int i, List(Str) path, TomlValue v, TomlTable acc) {
+    Result(TomlTable, SerialError) next = toml_put(acc, [], toml_segs(path, 0, []), v);
+    if (Ok(t) = next) { return toml_inline_next(in, i, t); }
+    if (Err(e) = next) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+Result(Parsed(TomlValue, Int), SerialError) toml_inline_next(Str in, Int i, TomlTable acc) {
+    Int m = tm_space(in, i);
+    if (at_char(in, m, 125)) { return parsed(TTable(tm_inline_of(acc)), m + 1); }
+    if (!at_char(in, m, 44)) { return Err(syntax_error("expected , or } at " + f"{m}")); }
+    return toml_inline_at(in, m + 1, acc);
+}

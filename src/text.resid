@@ -1,0 +1,116 @@
+// text.resid — the text-level pieces of TOML: character classes, key and
+// string quoting, and number rendering. Both directions, no format state.
+
+import "../../resid-serial/src/serial.resid";
+
+// ─── Characters ──────────────────────────────────────────────────────
+
+pub Bool tm_is_digit(Int c) { return c >= 48 && c <= 57; }
+
+// What a bare key may hold: letters, digits, underscore, dash.
+pub Bool tm_is_bare_key(Int c) {
+    return tm_is_digit(c) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c == 45;
+}
+
+pub Bool tm_is_space(Int c) { return c == 32 || c == 9; }
+
+pub Bool tm_is_newline(Int c) { return c == 10; }
+
+pub Bool tm_is_hex(Int c) { return tm_is_digit(c) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70); }
+
+pub Int tm_hex_value(Int c) {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    return c - 55;
+}
+
+pub Str tm_hex_digit(Int n) { return str_slice("0123456789abcdef", n, n + 1); }
+
+// ─── Keys ────────────────────────────────────────────────────────────
+
+// A key as TOML writes it: bare when it can be, a basic string otherwise.
+// A bare key that would read as something else is quoted, since `1 = 2`
+// and `-x = 1` would mean a value and a key, not the names.
+pub Str tm_key(Str k) {
+    if (tm_bare_ok(k)) { return k; }
+    return tm_quote_basic(k);
+}
+
+Bool tm_bare_ok(Str k) {
+    if (k == "") { return false; }
+    if (k == "true" || k == "false" || k == "inf" || k == "nan") { return false; }
+    if (tm_is_digit(str_char_at(k, 0))) { return false; }
+    if (str_char_at(k, 0) == 45 || str_char_at(k, 0) == 43) { return false; }
+    return tm_bare_ok_at(k, 0);
+}
+
+Bool tm_bare_ok_at(Str k, Int i) {
+    if (i >= str_len(k)) { return true; }
+    if (!tm_is_bare_key(str_char_at(k, i))) { return false; }
+    return tm_bare_ok_at(k, i + 1);
+}
+
+// ─── Strings ─────────────────────────────────────────────────────────
+
+// A string as TOML writes it. A basic string with TOML's own escapes keeps
+// the text exact, which is what a round trip needs; a literal string would
+// read the same but cannot hold a quote or a backslash.
+pub Str tm_str(Str s) { return tm_quote_basic(s); }
+
+// A basic string: "..." with the escapes TOML defines.
+pub Str tm_quote_basic(Str s) { return tm_quote_basic_at(s, 0, StrBuf().push("\"")); }
+
+// A quoted string, gathered in one builder rather than a fresh string per
+// character.
+Str tm_quote_basic_at(Str s, Int i, StrBuf b) {
+    if (i >= str_len(s)) { return b.push("\"").finish(); }
+    Int c = str_char_at(s, i);
+    return tm_quote_basic_at(s, i + 1, b.push(tm_escape_char(c)));
+}
+
+pub Str tm_escape_char(Int c) {
+    if (c == 34) { return "\\\""; }
+    if (c == 92) { return "\\\\"; }
+    if (c == 8) { return "\\b"; }
+    if (c == 9) { return "\\t"; }
+    if (c == 10) { return "\\n"; }
+    if (c == 12) { return "\\f"; }
+    if (c == 13) { return "\\r"; }
+    if (c < 32 || c == 127) { return tm_escape_hex(c, 4); }
+    return str_from_code(c);
+}
+
+Str tm_escape_hex(Int c, Int width) { return tm_escape_hex_at(c, width, StrBuf().push("\\u")); }
+
+Str tm_escape_hex_at(Int c, Int width, StrBuf b) {
+    if (width <= 0) { return b.finish(); }
+    return tm_escape_hex_at(c, width - 1, b.push(tm_hex_digit((c >> (4 * (width - 1))) & 15)));
+}
+
+// ─── Numbers ─────────────────────────────────────────────────────────
+
+// A float as TOML writes it: a float needs a '.' or an exponent, and the
+// text a whole float prints as has neither.
+pub Str tm_float(Float v) {
+    if (tm_is_nan(v)) { return "nan"; }
+    if (tm_is_inf(v)) { return if (v < 0.0) { "-inf" } else { "inf" }; }
+    if (v == 0.0 && 1.0 / v < 0.0) { return "-0.0"; }
+    Str text = f"{v}";
+    if (tm_has_point(text)) { return text; }
+    return text + ".0";
+}
+
+Bool tm_has_point(Str text) { return tm_has_point_at(text, 0); }
+
+Bool tm_has_point_at(Str text, Int i) {
+    if (i >= str_len(text)) { return false; }
+    Int c = str_char_at(text, i);
+    if (c == 46 || c == 101 || c == 69) { return true; }
+    return tm_has_point_at(text, i + 1);
+}
+
+pub Bool tm_is_nan(Float v) { return v != v; }
+
+// An infinity is the only float whose halves are itself; the sign is
+// kept to the call, so both are recognized here.
+pub Bool tm_is_inf(Float v) { return !tm_is_nan(v) && v != 0.0 && v / 2.0 == v; }

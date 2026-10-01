@@ -1,0 +1,542 @@
+// roundtrip.resid — values through the whole pipeline: encode, decode and
+// compare. The instances are written by hand here, so the test also shows
+// what a hand-written instance looks like.
+
+import "../src/toml.resid";
+import "check.resid";
+
+// ─── The model ───────────────────────────────────────────────────────
+
+type Point = { Int x; Int y; };
+
+type Shape = Circle(Int) | Dot;
+
+type Named = { Str name; Int n; List(Point) corners; };
+
+type Config = { Str host; Int port; Option(Str) note; };
+
+// ─── Instances ───────────────────────────────────────────────────────
+
+@needs(Encoder(F))
+Result(F, SerialError) enc_point(Point p, F s) {
+    F s1 = write_struct_begin(s, "Point", 2)?;
+    F s2 = write_named(s1, "x", p.x)?;
+    F s3 = write_named(s2, "y", p.y)?;
+    return write_struct_end(s3);
+}
+Encode(Point, F) = enc_point;
+
+List(Str) point_fields() { return ["x", "y"]; }
+
+@needs(Decoder(F))
+Result(Parsed(Point, F), SerialError) dec_point(F s) {
+    F s1 = read_struct_begin(s, "Point", point_fields())?;
+    return dec_point_fields(s1, None, None);
+}
+Decode(Point, F) = dec_point;
+
+@needs(Decoder(F))
+Result(Parsed(Point, F), SerialError) dec_point_fields(F s, Option(Int) x, Option(Int) y) {
+    Parsed(FieldKey, F) k = read_field(s, point_fields())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => dec_point_slot(k.rest, i, x, y),
+        UnknownField(name) => dec_point_fields(skip_unknown(k.rest, name, point_fields(), false)?, x, y),
+        EndOfFields => finish_point(k.rest, x, y)
+    };
+}
+
+@needs(Decoder(F))
+Result(Parsed(Point, F), SerialError) dec_point_slot(F s, Int i, Option(Int) x, Option(Int) y) {
+    if (i == 0) {
+        Parsed(Option(Int), F) v = read_slot(s, x, "x")?;
+        return dec_point_fields(v.rest, v.value, y);
+    }
+    Parsed(Option(Int), F) v = read_slot(s, y, "y")?;
+    return dec_point_fields(v.rest, x, v.value);
+}
+
+Result(Parsed(Point, F), SerialError) finish_point(F s, Option(Int) x, Option(Int) y) {
+    Int xv = require(x, "x")?;
+    Int yv = require(y, "y")?;
+    return parsed(Point {.x = xv, .y = yv}, s);
+}
+
+@needs(Encoder(F))
+Result(F, SerialError) enc_shape(Shape v, F s) {
+    return match v {
+        Circle(r) => write_newtype_variant(s, "Shape", 0, "Circle", r),
+        Dot => write_unit_variant(s, "Shape", 1, "Dot")
+    };
+}
+Encode(Shape, F) = enc_shape;
+
+List(Str) shape_variants() { return ["Circle", "Dot"]; }
+
+@needs(Decoder(F))
+Result(Parsed(Shape, F), SerialError) dec_shape(F s) {
+    Parsed(Int, F) v = read_variant(s, "Shape", shape_variants())?;
+    if (v.value == 0) {
+        Parsed(Int, F) r = read_newtype_payload(v.rest, "Circle")?;
+        return parsed(Circle(r.value), r.rest);
+    }
+    return read_unit_payload(v.rest, Dot);
+}
+Decode(Shape, F) = dec_shape;
+
+@needs(Encoder(F))
+Result(F, SerialError) enc_named(Named v, F s) {
+    F s1 = write_struct_begin(s, "Named", 3)?;
+    F s2 = write_named(s1, "name", v.name)?;
+    F s3 = write_named(s2, "n", v.n)?;
+    F s4 = write_named(s3, "corners", v.corners)?;
+    return write_struct_end(s4);
+}
+Encode(Named, F) = enc_named;
+
+List(Str) named_fields() { return ["name", "n", "corners"]; }
+
+@needs(Decoder(F))
+Result(Parsed(Named, F), SerialError) dec_named(F s) {
+    F s1 = read_struct_begin(s, "Named", named_fields())?;
+    return dec_named_fields(s1, None, None, None);
+}
+Decode(Named, F) = dec_named;
+
+@needs(Decoder(F))
+Result(Parsed(Named, F), SerialError) dec_named_fields(F s, Option(Str) name, Option(Int) n, Option(List(Point)) corners) {
+    Parsed(FieldKey, F) k = read_field(s, named_fields())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => dec_named_slot(k.rest, i, name, n, corners),
+        UnknownField(f) => dec_named_fields(skip_unknown(k.rest, f, named_fields(), false)?, name, n, corners),
+        EndOfFields => finish_named(k.rest, name, n, corners)
+    };
+}
+
+@needs(Decoder(F))
+Result(Parsed(Named, F), SerialError) dec_named_slot(F s, Int i, Option(Str) name, Option(Int) n, Option(List(Point)) corners) {
+    if (i == 0) {
+        Parsed(Option(Str), F) v = read_slot(s, name, "name")?;
+        return dec_named_fields(v.rest, v.value, n, corners);
+    }
+    if (i == 1) {
+        Parsed(Option(Int), F) v = read_slot(s, n, "n")?;
+        return dec_named_fields(v.rest, name, v.value, corners);
+    }
+    Parsed(Option(List(Point)), F) v = read_slot(s, corners, "corners")?;
+    return dec_named_fields(v.rest, name, n, v.value);
+}
+
+Result(Parsed(Named, F), SerialError) finish_named(F s, Option(Str) name, Option(Int) n, Option(List(Point)) corners) {
+    Str nv = require(name, "name")?;
+    Int iv = require(n, "n")?;
+    List(Point) cv = require(corners, "corners")?;
+    return parsed(Named {.name = nv, .n = iv, .corners = cv}, s);
+}
+
+@needs(Encoder(F))
+Result(F, SerialError) enc_config(Config v, F s) {
+    F s1 = write_struct_begin(s, "Config", 3)?;
+    F s2 = write_named(s1, "host", v.host)?;
+    F s3 = write_named(s2, "port", v.port)?;
+    F s4 = write_named_if(s3, has_note(v.note), "note", v.note)?;
+    return write_struct_end(s4);
+}
+Encode(Config, F) = enc_config;
+
+List(Str) config_fields() { return ["host", "port", "note"]; }
+
+@needs(Decoder(F))
+Result(Parsed(Config, F), SerialError) dec_config(F s) {
+    F s1 = read_struct_begin(s, "Config", config_fields())?;
+    return dec_config_fields(s1, None, None, None);
+}
+Decode(Config, F) = dec_config;
+
+@needs(Decoder(F))
+Result(Parsed(Config, F), SerialError) dec_config_fields(F s, Option(Str) host, Option(Int) port, Option(Str) note) {
+    Parsed(FieldKey, F) k = read_field(s, config_fields())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => dec_config_slot(k.rest, i, host, port, note),
+        UnknownField(f) => dec_config_fields(skip_unknown(k.rest, f, config_fields(), false)?, host, port, note),
+        EndOfFields => finish_config(k.rest, host, port, note)
+    };
+}
+
+@needs(Decoder(F))
+Result(Parsed(Config, F), SerialError) dec_config_slot(F s, Int i, Option(Str) host, Option(Int) port, Option(Str) note) {
+    if (i == 0) {
+        Parsed(Option(Str), F) v = read_slot(s, host, "host")?;
+        return dec_config_fields(v.rest, v.value, port, note);
+    }
+    if (i == 1) {
+        Parsed(Option(Int), F) v = read_slot(s, port, "port")?;
+        return dec_config_fields(v.rest, host, v.value, note);
+    }
+        Parsed(Option(Str), F) v = read_slot(s, note, "note")?;
+        return dec_config_fields(v.rest, host, port, v.value);
+}
+
+Result(Parsed(Config, F), SerialError) finish_config(F s, Option(Str) host, Option(Int) port, Option(Str) note) {
+    Str hv = require(host, "host")?;
+    Int pv = require(port, "port")?;
+    return parsed(Config {.host = hv, .port = pv, .note = note}, s);
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────
+
+pub Str quote() { return "\""; }
+
+Str text_of(Result(Str, SerialError) r) {
+    if (Err(e) = r) { return "encode: " + error_text(e); }
+    if (Ok(s) = r) { return s; }
+    return "unreachable";
+}
+
+Str point_text(Point p) { return f"({p.x}, {p.y})"; }
+
+Str shape_text(Shape v) { return match v { Circle(r) => f"Circle({r})", Dot => "Dot" }; }
+
+Str trip_point(Point p) { return point_text(point_back(text_of(to_toml(p)))); }
+
+Point point_back(Str text) {
+    Result(Point, SerialError) r = from_toml(text);
+    if (Err(e) = r) { return Point {.x = 0 - 1, .y = error_len(e)}; }
+    if (Ok(v) = r) { return v; }
+    return Point {.x = 0 - 1, .y = 0 - 1};
+}
+
+Int error_len(SerialError e) { return str_len(error_text(e)); }
+
+Str trip_shape(Shape v) { return shape_text(shape_back(text_of(to_toml(v)))); }
+
+Shape shape_back(Str text) {
+    if (text.len() > 7 && str_slice(text, 0, 7) == "encode:") { return Circle(0 - 99); }
+    Result(Shape, SerialError) r = from_toml(text);
+    if (Err(e) = r) { return Circle(error_len(e)); }
+    if (Ok(v) = r) { return v; }
+    return Circle(0 - 1);
+}
+
+Str trip_named(Named v) { return named_text(named_back(text_of(to_toml(v)))); }
+
+Str named_text(Named v) { return v.name + "/" + f"{v.n}" + "/" + f"{v.corners.len()} corners"; }
+
+Named named_back(Str text) {
+    if (text.len() > 7 && str_slice(text, 0, 7) == "encode:") { return Named {.name = text, .n = 0 - 1, .corners = []}; }
+    Result(Named, SerialError) r = from_toml(text);
+    if (Err(e) = r) { return Named {.name = error_text(e), .n = 0, .corners = []}; }
+    if (Ok(v) = r) { return v; }
+    return Named {.name = "unreachable", .n = 0, .corners = []};
+}
+
+// A scalar goes out as a value in a table and comes back the same way.
+// The text it is written as is checked next to it, since that is what a
+// TOML document has to look like.
+Str trip_str2(Str want) { return scal_str_back(text_of(to_toml(scal_str(want)))); }
+
+Str trip_int2(Int want) { return scal_int_back(text_of(to_toml(scal_int(want)))); }
+
+Str trip_float2(Float want) { return scal_float_back(text_of(to_toml(scal_float(want)))); }
+
+Str trip_bool2(Bool want) { return scal_bool_back(text_of(to_toml(scal_bool(want)))); }
+
+Str trip_list2(List(Int) want) { return scal_list_back(text_of(to_toml(scal_list(want)))); }
+
+Scalars scal_str(Str s) { return Scalars {.s = Some(s), .n = None, .f = None, .b = None, .xs = None}; }
+
+Scalars scal_int(Int n) { return Scalars {.s = None, .n = Some(n), .f = None, .b = None, .xs = None}; }
+
+Scalars scal_float(Float f) { return Scalars {.s = None, .n = None, .f = Some(f), .b = None, .xs = None}; }
+
+Scalars scal_bool(Bool b) { return Scalars {.s = None, .n = None, .f = None, .b = Some(b), .xs = None}; }
+
+Scalars scal_list(List(Int) xs) { return Scalars {.s = None, .n = None, .f = None, .b = None, .xs = Some(xs)}; }
+
+Option(Str) field_s(Scalars v) { return v.s; }
+
+Option(Int) field_n(Scalars v) { return v.n; }
+
+Option(Float) field_f(Scalars v) { return v.f; }
+
+Option(Bool) field_b(Scalars v) { return v.b; }
+
+Option(List(Int)) field_xs(Scalars v) { return v.xs; }
+
+Str scal_str_back(Str text) {
+    Result(Scalars, SerialError) r = from_toml(text);
+    if (Err(e) = r) { return "decode: " + error_text(e); }
+    if (Ok(v) = r) { return match field_s(v) { Some(x) => x, None => "absent" }; }
+    return "unreachable";
+}
+
+Str scal_int_back(Str text) {
+    Result(Scalars, SerialError) r = from_toml(text);
+    if (Err(e) = r) { return "decode: " + error_text(e); }
+    if (Ok(v) = r) { return match field_n(v) { Some(x) => f"{x}", None => "absent" }; }
+    return "unreachable";
+}
+
+Str scal_float_back(Str text) {
+    Result(Scalars, SerialError) r = from_toml(text);
+    if (Err(e) = r) { return "decode: " + error_text(e); }
+    if (Ok(v) = r) { return match field_f(v) { Some(x) => f"{x}", None => "absent" }; }
+    return "unreachable";
+}
+
+Str scal_bool_back(Str text) {
+    Result(Scalars, SerialError) r = from_toml(text);
+    if (Err(e) = r) { return "decode: " + error_text(e); }
+    if (Ok(v) = r) { return match field_b(v) { Some(x) => f"{x}", None => "absent" }; }
+    return "unreachable";
+}
+
+Str scal_list_back(Str text) {
+    Result(Scalars, SerialError) r = from_toml(text);
+    if (Err(e) = r) { return "decode: " + error_text(e); }
+    if (Ok(v) = r) { return match field_xs(v) { Some(x) => f"{x}", None => "absent" }; }
+    return "unreachable";
+}
+
+// A fixed-capacity string in a table, which the format streams a code point
+// at a time in both directions.
+type FixedBox = { Str(16) s; };
+
+@needs(Encoder(F))
+Result(F, SerialError) enc_fixed_box(FixedBox v, F s) {
+    F s1 = write_struct_begin(s, "FixedBox", 1)?;
+    F s2 = write_named(s1, "s", v.s)?;
+    return write_struct_end(s2);
+}
+Encode(FixedBox, F) = enc_fixed_box;
+
+@needs(Decoder(F))
+Result(Parsed(FixedBox, F), SerialError) dec_fixed_box(F s) {
+    F s1 = read_struct_begin(s, "FixedBox", ["s"])?;
+    return dec_fixed_box_fields(s1, None);
+}
+Decode(FixedBox, F) = dec_fixed_box;
+
+@needs(Decoder(F))
+Result(Parsed(FixedBox, F), SerialError) dec_fixed_box_fields(F s, Option(Str(16)) got) {
+    Parsed(FieldKey, F) k = read_field(s, ["s"])?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => dec_fixed_box_slot(k.rest, i, got),
+        UnknownField(f) => dec_fixed_box_fields(skip_unknown(k.rest, f, ["s"], false)?, got),
+        EndOfFields => parsed(FixedBox {.s = require(got, "s")?}, k.rest)
+    };
+}
+
+@needs(Decoder(F))
+Result(Parsed(FixedBox, F), SerialError) dec_fixed_box_slot(F s, Int i, Option(Str(16)) got) {
+    Parsed(Option(Str(16)), F) v = read_slot(s, got, "s")?;
+    return dec_fixed_box_fields(v.rest, v.value);
+}
+
+Str fixed_back(Str doc) {
+    Result(FixedBox, SerialError) r = from_toml(doc);
+    if (Err(e) = r) { return "decode: " + error_text(e); }
+    if (Ok(v) = r) { return f"{v.s}/{utf8_count(v.s)}"; }
+    return "unreachable";
+}
+
+Int main() {
+    // Records, which are tables with their fields as keys.
+    check_text("struct", trip_point(Point {.x = 1, .y = 2}), "(1, 2)");
+    check_text("struct/hex", text_of(to_toml(Point {.x = 1, .y = 2})), "x = 1\ny = 2\n");
+    check_text("struct/negative", trip_point(Point {.x = 0 - 5, .y = 1000000}), "(-5, 1000000)");
+
+    // Enums, internally tagged with `type`.
+    check_text("enum/Circle", trip_shape(Circle(3)), "Circle(3)");
+    check_text("enum/Dot", trip_shape(Dot), "Dot");
+    // A variant at the top of a document has no key to sit under, so its
+    // own keys are the document's keys.
+    check_text("enum/Dot text", text_of(to_toml(dot_shape())), "type = \"Dot\"\n");
+
+    // A record with a nested record and a list of them: sections and an
+    // array of tables.
+    List(Point) corners = [Point {.x = 0, .y = 0}, Point {.x = 3, .y = 4}];
+    check_text("nested", trip_named(Named {.name = "n", .n = 5, .corners = corners}), "n/5/2 corners");
+    check_text("nested/text", text_of(to_toml(Named {.name = "n", .n = 5, .corners = corners})),
+        "name = \"n\"\nn = 5\n[[corners]]\nx = 0\ny = 0\n[[corners]]\nx = 3\ny = 4\n");
+
+    // An option field that is absent, and one that is there.
+    check_text("config", trip_config(Config {.host = "h", .port = 1, .note = None}), "h/1/None");
+    Option(Str) note = Some("hi");
+    check_text("config/note", trip_config(Config {.host = "h", .port = 1, .note = note}), "h/1/Some(hi)");
+
+    // The scalars.
+    check_text("str/empty", trip_str2(""), "");
+    check_text("str/ascii", trip_str2("hello"), "hello");
+    check_text("str/utf8", trip_str2("héllo — ünïcode"), "héllo — ünïcode");
+    check_text("str/emoji", trip_str2("a🌍b"), "a🌍b");
+    check_text("str/text", text_of(to_toml(scal_str("hi"))), "s = \"hi\"\n");
+
+    // A string with a fixed capacity is streamed out and back a code point
+    // at a time, which is a different path from a plain Str. Streaming it
+    // out is what the no-op verbs used to lose entirely.
+    Str(16) hello = "héllo";
+    check_text("str/fixed text", text_of(to_toml(FixedBox {.s = hello})), "s = \"héllo\"\n");
+    check_text("str/fixed back", fixed_back("s = \"héllo\"\n"), "héllo/6");
+    check_text("str/fixed empty", fixed_back("s = \"\"\n"), "/0");
+    check_text("str/fixed emoji", fixed_back("s = \"a🌍b\"\n"), "a🌍b/6");
+    check_text("str/fixed too long", fixed_back("s = \"abcdefghijklmnopqrstuvwxyz\"\n"),
+        "decode: invalid length 26, expected a string of at most 16 bytes at .s");
+
+    check_text("int/0", trip_int2(0), "0");
+    check_text("int/neg", trip_int2(0 - 1), "-1");
+    check_text("int/big", trip_int2(9223372036854775807), "9223372036854775807");
+    check_text("float/1.5", trip_float2(1.5), "1.5");
+    check_text("float/whole", trip_float2(1.0), "1");
+    check_text("float/text", text_of(to_toml(scal_float(1.0))), "f = 1.0\n");
+    check_text("bool", trip_bool2(true), "true");
+    check_text("list/empty", trip_list2([]), "[]");
+    check_text("list", trip_list2([1, 2, 3]), "[1, 2, 3]");
+    check_text("list/text", text_of(to_toml(scal_list([1, 2, 3]))), "xs = [1, 2, 3]\n");
+
+    // What the format cannot hold.
+    check_text("none", text_of(to_toml(no_int())), "encode: None, which TOML has no null for" + " is not supported by this format");
+    check_text("bytes", text_of(to_toml(byte_buf([1, 2]))), "encode: bytes is not supported by this format");
+    check_text("u128 past 64", text_of(to_toml(u128(18446744073709551615))), "encode: invalid value 18446744073709551615, expected a TOML integer, which is 64 bits");
+    check_text("unit", text_of(to_toml(unit())), "encode: a unit value, which TOML has no spelling for is not supported by this format");
+
+    return 0;
+}
+
+Str trip_config(Config c) { return config_text(config_back(text_of(to_toml(c)))); }
+
+Str config_text(Config c) { return c.host + "/" + f"{c.port}" + "/" + show_note(c.note); }
+
+Str show_note(Option(Str) n) { return match n { Some(v) => "Some(" + v + ")", None => "None" }; }
+
+Bool has_note(Option(Str) n) { return note_yes(n); }
+
+Bool note_yes(Option(Str) n) { return match n { Some(_) => true, None => false }; }
+
+// An Option(Option(Str)) field that was absent is None, and one that was
+// there holds the note.
+Str unnote(Option(Option(Str)) outer) { return note_text(outer); }
+
+Str note_text(Option(Option(Str)) outer) {
+    return match outer { Some(inner) => inner_yes(inner), None => "None" };
+}
+
+Str inner_yes(Option(Str) inner) { return match inner { Some(v) => v, None => "None" }; }
+
+Config config_back(Str text) {
+    if (text.len() > 7 && str_slice(text, 0, 7) == "encode:") { return Config {.host = text, .port = 0 - 1, .note = None}; }
+    Result(Config, SerialError) r = from_toml(text);
+    if (Err(e) = r) { return Config {.host = error_text(e), .port = 0, .note = None}; }
+    if (Ok(v) = r) { return v; }
+    return Config {.host = "unreachable", .port = 0, .note = None};
+}
+
+Option(Int) no_int() { return None; }
+
+// A TOML document is a table, so a scalar only exists as a value in one.
+// Every field is optional, so a test can carry just the one it is about.
+type Scalars = {
+    Option(Str) s;
+    Option(Int) n;
+    Option(Float) f;
+    Option(Bool) b;
+    Option(List(Int)) xs;
+};
+
+@needs(Encoder(F))
+Result(F, SerialError) enc_scalars(Scalars v, F s) {
+    F s1 = write_struct_begin(s, "Scalars", 5)?;
+    F s2 = enc_scalars_str(s1, v.s)?;
+    F s3 = enc_scalars_int(s2, v.n)?;
+    F s4 = enc_scalars_float(s3, v.f)?;
+    F s5 = enc_scalars_bool(s4, v.b)?;
+    return enc_scalars_list(s5, v.xs);
+}
+Encode(Scalars, F) = enc_scalars;
+
+@needs(Encoder(F))
+Result(F, SerialError) enc_scalars_str(F s, Option(Str) v) {
+    if (Some(x) = v) { return write_named(s, "s", x); }
+    return Ok(s);
+}
+
+@needs(Encoder(F))
+Result(F, SerialError) enc_scalars_int(F s, Option(Int) v) {
+    if (Some(x) = v) { return write_named(s, "n", x); }
+    return Ok(s);
+}
+
+@needs(Encoder(F))
+Result(F, SerialError) enc_scalars_float(F s, Option(Float) v) {
+    if (Some(x) = v) { return write_named(s, "f", x); }
+    return Ok(s);
+}
+
+@needs(Encoder(F))
+Result(F, SerialError) enc_scalars_bool(F s, Option(Bool) v) {
+    if (Some(x) = v) { return write_named(s, "b", x); }
+    return Ok(s);
+}
+
+@needs(Encoder(F))
+Result(F, SerialError) enc_scalars_list(F s, Option(List(Int)) v) {
+    if (Some(x) = v) { return write_named(s, "xs", x); }
+    return write_struct_end(s);
+}
+
+@needs(Decoder(F))
+Result(Parsed(Scalars, F), SerialError) dec_scalars(F s) {
+    F s1 = read_struct_begin(s, "Scalars", scalars_fields())?;
+    return dec_scalars_fields(s1, None, None, None, None, None);
+}
+Decode(Scalars, F) = dec_scalars;
+
+List(Str) scalars_fields() { return ["s", "n", "f", "b", "xs"]; }
+
+@needs(Decoder(F))
+Result(Parsed(Scalars, F), SerialError) dec_scalars_fields(F s, Option(Str) str, Option(Int) n, Option(Float) f, Option(Bool) b, Option(List(Int)) xs) {
+    Parsed(FieldKey, F) k = read_field(s, scalars_fields())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => dec_scalars_slot(k.rest, i, str, n, f, b, xs),
+        UnknownField(name) => dec_scalars_fields(skip_unknown(k.rest, name, scalars_fields(), false)?, str, n, f, b, xs),
+        EndOfFields => parsed(Scalars {.s = str, .n = n, .f = f, .b = b, .xs = xs}, k.rest)
+    };
+}
+
+@needs(Decoder(F))
+Result(Parsed(Scalars, F), SerialError) dec_scalars_slot(F s, Int i, Option(Str) str, Option(Int) n, Option(Float) f, Option(Bool) b, Option(List(Int)) xs) {
+    if (i == 0) {
+        Parsed(Option(Str), F) v = read_slot(s, str, "s")?;
+        return dec_scalars_fields(v.rest, v.value, n, f, b, xs);
+    }
+    if (i == 1) {
+        Parsed(Option(Int), F) v = read_slot(s, n, "n")?;
+        return dec_scalars_fields(v.rest, str, v.value, f, b, xs);
+    }
+    if (i == 2) {
+        Parsed(Option(Float), F) v = read_slot(s, f, "f")?;
+        return dec_scalars_fields(v.rest, str, n, v.value, b, xs);
+    }
+    if (i == 3) {
+        Parsed(Option(Bool), F) v = read_slot(s, b, "b")?;
+        return dec_scalars_fields(v.rest, str, n, f, v.value, xs);
+    }
+    Parsed(Option(List(Int)), F) v = read_slot(s, xs, "xs")?;
+    return dec_scalars_fields(v.rest, str, n, f, b, v.value);
+}
+
+Shape dot_shape() { return shape_of(true); }
+
+Shape shape_of(Bool unit) { return shape_pick(unit); }
+
+Shape shape_pick(Bool unit) { return shape_done(unit); }
+
+Shape shape_done(Bool unit) { return shape_last(unit); }
+
+Shape shape_last(Bool unit) { return shape_end(unit); }
+
+Shape shape_end(Bool unit) { return Dot; }

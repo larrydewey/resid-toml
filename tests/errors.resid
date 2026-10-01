@@ -1,0 +1,269 @@
+// errors.resid — what the format reports when the document is wrong.
+// Every case is an error value with a kind and a path, never an abort.
+
+import "../src/toml.resid";
+import "check.resid";
+
+type Point = { Int x; Int y; };
+
+type Shape = Circle(Int) | Dot;
+
+List(Str) point_fields() { return ["x", "y"]; }
+
+List(Str) shape_variants() { return ["Circle", "Dot"]; }
+
+@needs(Decoder(F))
+Result(Parsed(Point, F), SerialError) dec_point(F s) {
+    F s1 = read_struct_begin(s, "Point", point_fields())?;
+    return dec_point_fields(s1, None, None);
+}
+Decode(Point, F) = dec_point;
+
+@needs(Decoder(F))
+Result(Parsed(Point, F), SerialError) dec_point_fields(F s, Option(Int) x, Option(Int) y) {
+    Parsed(FieldKey, F) k = read_field(s, point_fields())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => dec_point_slot(k.rest, i, x, y),
+        UnknownField(name) => dec_point_fields(skip_unknown(k.rest, name, point_fields(), false)?, x, y),
+        EndOfFields => finish_point(k.rest, x, y)
+    };
+}
+
+@needs(Decoder(F))
+Result(Parsed(Point, F), SerialError) dec_point_slot(F s, Int i, Option(Int) x, Option(Int) y) {
+    if (i == 0) {
+        Parsed(Option(Int), F) v = read_slot(s, x, "x")?;
+        return dec_point_fields(v.rest, v.value, y);
+    }
+    Parsed(Option(Int), F) v = read_slot(s, y, "y")?;
+    return dec_point_fields(v.rest, x, v.value);
+}
+
+Result(Parsed(Point, F), SerialError) finish_point(F s, Option(Int) x, Option(Int) y) {
+    Int xv = require(x, "x")?;
+    Int yv = require(y, "y")?;
+    return parsed(Point {.x = xv, .y = yv}, s);
+}
+
+@needs(Decoder(F))
+Result(Parsed(Shape, F), SerialError) dec_shape(F s) {
+    Parsed(Int, F) v = read_variant(s, "Shape", shape_variants())?;
+    if (v.value == 0) {
+        Parsed(Int, F) r = read_newtype_payload(v.rest, "Circle")?;
+        return parsed(Circle(r.value), r.rest);
+    }
+    return read_unit_payload(v.rest, Dot);
+}
+Decode(Shape, F) = dec_shape;
+
+// The message a decode gave, or the value.
+Str bad(Str doc) { return point_text(err_point(doc)); }
+
+Str point_text(Point p) { return f"{p.x},{p.y}"; }
+
+Point err_point(Str doc) {
+    Result(Point, SerialError) r = from_toml(doc);
+    if (Err(e) = r) { return Point {.x = 0 - 1, .y = 0 - 1}; }
+    if (Ok(v) = r) { return v; }
+    return Point {.x = 0 - 2, .y = 0 - 2};
+}
+
+Str err_text_of(Str doc) {
+    Result(Point, SerialError) r = from_toml(doc);
+    if (Err(e) = r) { return error_text(e); }
+    return "ok";
+}
+
+Str shape_err(Str doc) {
+    Result(Shape, SerialError) r = from_toml(doc);
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(v) = r) { return shape_text(v); }
+    return "unreachable";
+}
+
+Str shape_text(Shape v) {
+    Shape got = v;
+    return match got { Circle(n) => "Circle " + f"{n}", Dot => "Dot" };
+}
+
+type Nested = { Point p; };
+
+type Holder = { Shape k; };
+
+@needs(Decoder(F))
+Result(Parsed(Nested, F), SerialError) dec_nested(F s) {
+    F s1 = read_struct_begin(s, "Nested", ["p"])?;
+    return dec_nested_fields(s1, None);
+}
+Decode(Nested, F) = dec_nested;
+
+@needs(Decoder(F))
+Result(Parsed(Nested, F), SerialError) dec_nested_fields(F s, Option(Point) p) {
+    Parsed(FieldKey, F) k = read_field(s, ["p"])?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => dec_nested_slot(k.rest, i, p),
+        UnknownField(name) => dec_nested_fields(skip_unknown(k.rest, name, ["p"], false)?, p),
+        EndOfFields => parsed(Nested {.p = require(p, "p")?}, k.rest)
+    };
+}
+
+@needs(Decoder(F))
+Result(Parsed(Nested, F), SerialError) dec_nested_slot(F s, Int i, Option(Point) p) {
+    Parsed(Option(Point), F) v = read_slot(s, p, "p")?;
+    return dec_nested_fields(v.rest, v.value);
+}
+
+@needs(Decoder(F))
+Result(Parsed(Holder, F), SerialError) dec_holder(F s) {
+    F s1 = read_struct_begin(s, "Holder", ["k"])?;
+    return dec_holder_fields(s1, None);
+}
+Decode(Holder, F) = dec_holder;
+
+@needs(Decoder(F))
+Result(Parsed(Holder, F), SerialError) dec_holder_fields(F s, Option(Shape) k) {
+    Parsed(FieldKey, F) key = read_field(s, ["k"])?;
+    FieldKey f = key.value;
+    return match f {
+        KnownField(i) => dec_holder_slot(key.rest, i, k),
+        UnknownField(name) => dec_holder_fields(skip_unknown(key.rest, name, ["k"], false)?, k),
+        EndOfFields => parsed(Holder {.k = require(k, "k")?}, key.rest)
+    };
+}
+
+@needs(Decoder(F))
+Result(Parsed(Holder, F), SerialError) dec_holder_slot(F s, Int i, Option(Shape) k) {
+    Parsed(Option(Shape), F) v = read_slot(s, k, "k")?;
+    return dec_holder_fields(v.rest, v.value);
+}
+
+Str nested_err(Str doc) {
+    Result(Nested, SerialError) r = from_toml(doc);
+    if (Err(e) = r) { return error_text(e); }
+    return "ok";
+}
+
+Str holder_err(Str doc) {
+    Result(Holder, SerialError) r = from_toml(doc);
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(v) = r) { return shape_text(v.k); }
+    return "unreachable";
+}
+
+Str wrap_err(Str doc) {
+    Result(Scalars, SerialError) r = from_toml(doc);
+    if (Err(e) = r) { return error_text(e); }
+    return "ok";
+}
+
+type Scalars = {
+    Option(Str) s;
+    Option(Int) n;
+    Option(Float) f;
+    Option(Bool) b;
+    Option(List(Int)) xs;
+};
+
+List(Str) scalars_fields() { return ["s", "n", "f", "b", "xs"]; }
+
+@needs(Decoder(F))
+Result(Parsed(Scalars, F), SerialError) dec_scalars(F s) {
+    F s1 = read_struct_begin(s, "Scalars", scalars_fields())?;
+    return dec_scalars_fields(s1, None, None, None, None, None);
+}
+Decode(Scalars, F) = dec_scalars;
+
+@needs(Decoder(F))
+Result(Parsed(Scalars, F), SerialError) dec_scalars_fields(F s, Option(Str) str, Option(Int) n, Option(Float) f, Option(Bool) b, Option(List(Int)) xs) {
+    Parsed(FieldKey, F) k = read_field(s, scalars_fields())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => dec_scalars_slot(k.rest, i, str, n, f, b, xs),
+        UnknownField(name) => dec_scalars_fields(skip_unknown(k.rest, name, scalars_fields(), false)?, str, n, f, b, xs),
+        EndOfFields => parsed(Scalars {.s = str, .n = n, .f = f, .b = b, .xs = xs}, k.rest)
+    };
+}
+
+@needs(Decoder(F))
+Result(Parsed(Scalars, F), SerialError) dec_scalars_slot(F s, Int i, Option(Str) str, Option(Int) n, Option(Float) f, Option(Bool) b, Option(List(Int)) xs) {
+    if (i == 0) {
+        Parsed(Option(Str), F) v = read_slot(s, str, "s")?;
+        return dec_scalars_fields(v.rest, v.value, n, f, b, xs);
+    }
+    if (i == 1) {
+        Parsed(Option(Int), F) v = read_slot(s, n, "n")?;
+        return dec_scalars_fields(v.rest, str, v.value, f, b, xs);
+    }
+    if (i == 2) {
+        Parsed(Option(Float), F) v = read_slot(s, f, "f")?;
+        return dec_scalars_fields(v.rest, str, n, v.value, b, xs);
+    }
+    if (i == 3) {
+        Parsed(Option(Bool), F) v = read_slot(s, b, "b")?;
+        return dec_scalars_fields(v.rest, str, n, f, v.value, xs);
+    }
+    Parsed(Option(List(Int)), F) v = read_slot(s, xs, "xs")?;
+    return dec_scalars_fields(v.rest, str, n, f, b, v.value);
+}
+
+Int main() {
+    // ─── What the grammar refuses ─────────────────────────────────────
+    check_text("grammar/no value", err_text_of("x =\n"), "expected a value at 3");
+    check_text("grammar/no equals", err_text_of("x 1\n"), "expected = at 2");
+    check_text("grammar/bare word", err_text_of("x = y\n"), "expected a value at 4");
+    check_text("grammar/newline in string", err_text_of("x = \"abc\n"), "a newline in a string at 8");
+    check_text("grammar/unclosed table", err_text_of("[a\nn = 1\n"), "expected ] at 2");
+    check_text("grammar/unclosed inline", err_text_of("x = { a = 1\n"), "expected , or } at 11");
+    check_text("grammar/unclosed array", err_text_of("x = [1, 2\n"), "expected , or ] at 10");
+    check_text("grammar/empty key", err_text_of("= 1\n"), "expected a key at 0");
+    check_text("grammar/no header key", err_text_of("[]\nn = 1\n"), "expected a key at 1");
+
+    // A key or a table cannot be written twice.
+    check_text("duplicate/key", err_text_of("x = 1\nx = 2\n"), "`x` is defined twice");
+    check_text("duplicate/dotted", err_text_of("a.b = 1\na.b = 2\n"), "`b` is defined twice");
+    // A key after a header belongs to that table, so the same name in the
+    // root and in the table is not a duplicate.
+    check_text("duplicate/in a table", err_text_of("[a]\nn = 1\nn = 2\n"), "`n` is defined twice");
+    check_text("duplicate/root and table", wrap_err("n = 1\n[a]\nn = 2\n"), "ok");
+
+    // A header that would redefine what is there.
+    check_text("redefine/table as array", err_text_of("[a]\nn = 1\n[[a]]\n"), "`a` is already a value, not an array of tables");
+    check_text("redefine/array as table", err_text_of("[[a]]\nn = 1\n[[a.b]]\nn = 2\n[a.b]\n"), "`b` is already a value, not a table");
+    check_text("redefine/key as table", err_text_of("a = 1\n[a]\n"), "`a` is already a value, not a table");
+
+    // Numbers outside the range TOML has.
+    check_text("range/int too big", err_text_of("x = 9223372036854775808\n"), "invalid value 9223372036854775808, expected a TOML integer, which is 64 bits");
+    check_text("range/int too small", err_text_of("x = -9223372036854775809\n"), "invalid value -9223372036854775809, expected a TOML integer, which is 64 bits");
+    check_text("range/hex too big", err_text_of("x = 0xFFFFFFFFFFFFFFFF\n"), "invalid value 0xFFFFFFFFFFFFFFFF, expected a TOML integer, which is 64 bits");
+
+    // ─── What the types find missing ──────────────────────────────────
+    // A required field that the document does not have.
+    check_text("field/missing", err_text_of("x = 1\n"), "missing field `y`");
+    check_text("field/one of two", bad("x = 1\ny = 2\n"), "1,2");
+    // A field of the wrong type.
+    check_text("type/int for text", err_text_of("x = \"a\"\ny = 2\n"), "invalid type: expected an integer, found a string at .x");
+    check_text("type/array for int", err_text_of("x = [1]\ny = 2\n"), "invalid type: expected an integer, found an array at .x");
+    check_text("type/table for int", err_text_of("x = { a = 1 }\ny = 2\n"), "invalid type: expected an integer, found a table at .x");
+    check_text("type/scalar for table", nested_err("p = 1\n"), "invalid type: expected a table, found an integer at .p");
+
+    // ─── What a variant needs ─────────────────────────────────────────
+    check_text("variant/no type", shape_err("value = 3\n"), "missing field `type`");
+    check_text("variant/unknown", shape_err("type = \"Square\"\n"), "unknown variant `Square`, expected `Circle` or `Dot`");
+    check_text("variant/type not text", shape_err("type = 1\n"), "invalid type: expected a string, found an integer");
+    check_text("variant/not a table", holder_err("k = 1\n"), "invalid type: expected an enum variant, found an integer at .k");
+    check_text("variant/payload", shape_err("type = \"Circle\"\nvalue = 3\n"), "Circle 3");
+    check_text("variant/unit", shape_err("type = \"Dot\"\n"), "Dot");
+
+    // ─── A field's own type ───────────────────────────────────────────
+    check_text("option/absent", wrap_err("n = 1\n"), "ok");
+    check_text("option/wrong type", wrap_err("s = 1\n"), "invalid type: expected a string, found an integer at .s");
+    check_text("option/array wrong item", wrap_err("xs = [1, \"a\"]\n"), "invalid type: expected an integer, found a string at .xs[1]");
+
+    // ─── Reading past the end ─────────────────────────────────────────
+    check_text("end/one document", bad("x = 1\ny = 2\n"), "1,2");
+    check_text("end/empty document", err_text_of(""), "missing field `x`");
+
+    return 0;
+}

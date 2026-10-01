@@ -1,0 +1,923 @@
+// toml.resid — TOML as a format for resid-serial.
+//
+//   toml.resid   the format: an Encoder and a Decoder
+//   parse.resid  the grammar, parsed into a tree
+//   text.resid   key and string quoting, number rendering
+//
+// TOML is text, and a document is a table: `key = value` lines at the top
+// and `[table]` sections below, with a table's own keys inside its section.
+// Two things follow from that shape.
+//
+// Decoding parses the whole document first and then navigates the tree, so
+// a field may be asked for by name in any order, a key may be written
+// before or after the table it belongs to, and a dotted key may reach into
+// a table from anywhere.
+//
+// Encoding collects one leaf per value, with the path it was written at,
+// and renders the tree at the end. A length cannot be known while a
+// section is being written, and a struct's fields arrive in the order the
+// type declares them, so the leaves are gathered first and the sections
+// come out of them: a table's own keys, then a section per sub-table, and
+// `[[name]]` per element of an array of tables.
+//
+// Representation choices, all of which round-trip through this package:
+//
+//   struct          a table, its fields as keys
+//   map             a table, so the keys have to be strings
+//   sequence        an array
+//   Str, Int, Float, Bool
+//                   the values themselves
+//   Option          Some(v) is v; TOML has no null, so None has no
+//                   spelling and is refused
+//   unit            no spelling either, so it is refused on the way in and
+//                   writes nothing on the way out
+//   bytes, Dec(N)   no spelling; refused
+//   Int(128), UInt(128)
+//                   an integer while it fits in the 64 bits TOML has
+//   variant         an inline table with a `type` key: {type = "Circle",
+//                   value = 3}, and a unit variant is {type = "Dot"}
+//   a date-time     a string, since the data model has no date: the text is
+//                   kept as written and reads back the same
+
+import "../../resid-serial/src/serial.resid";
+import "text.resid";
+import "parse.resid";
+
+// ─── The encoder ─────────────────────────────────────────────────────
+
+// One value that was written, and the path it was written at.
+type TomlLeaf = { List(TomlSeg) path; TomlValue value; };
+
+// The key a value belongs to: a name, an array index, or nothing yet.
+type TomlPending = TpKey(TomlText) | TpIdx(TomlInt) | TpInl(TomlText) | TpNone;
+
+// A table the encoder is inside: where it was, and which element of an
+// array of tables it is writing.
+type TomlScope = { List(TomlSeg) path; Int idx; };
+
+type TomlEnc = {
+    List(TomlLeaf) leaves;
+    List(TomlSeg) path;
+    List(TomlScope) stack;
+    Int idx;
+    TomlPending pending;
+    Bool in_key;
+    Bool keyed;      // every value so far had a key, an index or a section
+    Str sbuf;        // the code points of a string being streamed in
+    Bool streamed;
+};
+
+pub TomlEnc toml_encoder() {
+    return TomlEnc {.leaves = [], .path = [], .stack = [], .idx = 0, .pending = TpNone, .in_key = false, .keyed = true, .sbuf = "", .streamed = false};
+}
+
+// The document as TOML text.
+pub Str toml_text(TomlEnc e) {
+    // The root table has no path segment of its own, so its pairs are the
+    // distinct first segments of the leaves.
+    return toml_render(TTable(toml_pairs(e.leaves, 0, 0, e.leaves.len())), "");
+}
+
+Bool tp_is_none(TomlPending p) { return match p { TpNone => true, _ => false }; }
+
+// A key of a table written in braces, which the variant's own keys are.
+Bool tp_is_inl(TomlPending p) { return match p { TpInl(_) => true, _ => false }; }
+
+Bool tp_is_key(TomlPending p) { return match p { TpKey(_) => true, _ => false }; }
+
+Bool tp_is_idx(TomlPending p) { return match p { TpIdx(_) => true, _ => false }; }
+
+Str tp_text(TomlPending p) {
+    TomlText empty = TomlText {.s = ""};
+    TomlText got = match p { TpKey(k) => k, TpInl(k) => k, _ => empty };
+    return got.s;
+}
+
+Int tp_pos(TomlPending p) {
+    TomlInt empty = TomlInt {.n = 0};
+    TomlInt got = match p { TpIdx(n) => n, _ => empty };
+    return got.n;
+}
+
+TomlEnc te_of(List(TomlLeaf) leaves, List(TomlSeg) path, List(TomlScope) stack, Int idx, TomlPending pending, Bool in_key) {
+    return TomlEnc {.leaves = leaves, .path = path, .stack = stack, .idx = idx, .pending = pending, .in_key = in_key, .keyed = e_keyed(leaves), .sbuf = "", .streamed = false};
+}
+
+// A document is a table, so a value with no key above it has nowhere to go.
+Bool e_keyed(List(TomlLeaf) leaves) { return !toml_has_bare(leaves, 0); }
+
+// A value with no name above it, or one whose first name is an index, has
+// nowhere to go: a document is a table, and only a key can name something
+// in it.
+Bool toml_has_bare(List(TomlLeaf) leaves, Int i) {
+    if (i >= leaves.len()) { return false; }
+    List(TomlSeg) path = leaves[i].path;
+    if (path.len() == 0) { return true; }
+    if (!seg_is_key(path[0])) { return true; }
+    return toml_has_bare(leaves, i + 1);
+}
+
+// A leaf at the current path, one segment deeper for a key or an index.
+TomlEnc te_leaf(TomlEnc e, TomlValue v) {
+    List(TomlSeg) at = if (tp_is_none(e.pending)) { e.path } else { e.path.concat([toml_seg_of(e.pending)]) };
+    List(TomlLeaf) leaves = e.leaves.concat([TomlLeaf {.path = at, .value = v}]);
+    return TomlEnc {.leaves = leaves, .path = e.path, .stack = e.stack, .idx = e.idx, .pending = TpNone, .in_key = false, .keyed = e_keyed(leaves), .sbuf = "", .streamed = false};
+}
+
+TomlSeg toml_seg_of(TomlPending p) {
+    if (tp_is_key(p)) { return seg_key(tp_text(p)); }
+    if (tp_is_inl(p)) { return seg_inline(tp_text(p)); }
+    if (tp_is_idx(p)) { return seg_idx(tp_pos(p)); }
+    return seg_key("");
+}
+
+// A table opens below the key that was given for it, and closes back to
+// where it was.
+Result(TomlEnc, SerialError) te_table_begin(TomlEnc e) {
+    List(TomlSeg) below = if (tp_is_none(e.pending)) { e.path } else { e.path.concat([toml_seg_of(e.pending)]) };
+    return Ok(te_of(e.leaves, below, e.stack.concat([TomlScope {.path = e.path, .idx = e.idx}]), 0, TpNone, false));
+}
+
+Result(TomlEnc, SerialError) te_table_end(TomlEnc e) {
+    if (e.stack.len() == 0) { return Ok(e); }
+    Int top = e.stack.len() - 1;
+    TomlScope back = e.stack[top];
+    return Ok(te_of(e.leaves, back.path, e.stack[0..top], back.idx, TpNone, false));
+}
+
+// ─── The encoder's verbs ─────────────────────────────────────────────
+
+// A unit value has no spelling: a table with no keys in it would read
+// back as an empty table, not as a unit.
+Result(TomlEnc, SerialError) te_unit(TomlEnc e) { return Err(unsupported("a unit value, which TOML has no spelling for")); }
+
+Result(TomlEnc, SerialError) te_bool(TomlEnc e, Bool v) { return Ok(te_leaf(e, TBool(TomlBool {.b = v}))); }
+
+Result(TomlEnc, SerialError) te_int(TomlEnc e, Int v) { return Ok(te_leaf(e, TInt(TomlInt {.n = v}))); }
+
+Result(TomlEnc, SerialError) te_uint(TomlEnc e, UInt(64) v) {
+    if (v > u64(9223372036854775807)) { return Err(toml_int_range(f"{v}")); }
+    return Ok(te_leaf(e, TInt(TomlInt {.n = (Int)v})));
+}
+
+Result(TomlEnc, SerialError) te_i128(TomlEnc e, Int(128) v) {
+    if (v > i128(9223372036854775807) || v < i128(0) - i128(9223372036854775807) - i128(1)) { return Err(toml_int_range(f"{v}")); }
+    return Ok(te_leaf(e, TInt(TomlInt {.n = (Int)v})));
+}
+
+Result(TomlEnc, SerialError) te_u128(TomlEnc e, UInt(128) v) {
+    if (v > u128(9223372036854775807)) { return Err(toml_int_range(f"{v}")); }
+    return Ok(te_leaf(e, TInt(TomlInt {.n = (Int)v})));
+}
+
+Result(TomlEnc, SerialError) te_float(TomlEnc e, Float v) { return Ok(te_leaf(e, TReal(TomlReal {.n = v}))); }
+
+Result(TomlEnc, SerialError) te_str(TomlEnc e, Str v) { return Ok(te_leaf_str(e, v)); }
+
+// A map key arrives as a string value; it becomes the name of the element
+// its value fills.
+TomlEnc te_leaf_str(TomlEnc e, Str v) {
+    if (e.in_key) { return te_of(e.leaves, e.path, e.stack, e.idx, TpKey(TomlText {.s = v}), false); }
+    return te_leaf(e, TStr(TomlText {.s = v}));
+}
+
+SerialError toml_int_range(Str text) { return invalid_value(text, "a TOML integer, which is 64 bits"); }
+
+Result(TomlEnc, SerialError) te_bytes(TomlEnc e, List(Int) v) { return Err(unsupported("bytes")); }
+
+Result(TomlEnc, SerialError) te_dec(TomlEnc e, Str v) { return Err(unsupported("a decimal, which TOML has no spelling for")); }
+
+Result(TomlEnc, SerialError) te_none(TomlEnc e) { return Err(unsupported("None, which TOML has no null for")); }
+Result(TomlEnc, SerialError) te_some(TomlEnc e) { return Ok(e); }
+
+// A string streamed from where it lives comes a code point at a time, so it
+// is gathered and written as one value when it ends. A Str(N) is at most N
+// code points, so this is bounded by the type.
+//
+// The leaf is written here rather than through te_str, which does the same
+// thing: the extra call is enough compile-time reduction to leave this one
+// residual.
+Result(TomlEnc, SerialError) te_str_begin(TomlEnc e, Int chars, Int bytes) { return Ok(te_sbuf(e, "", true)); }
+Result(TomlEnc, SerialError) te_str_char(TomlEnc e, Int cp) { return Ok(te_sbuf(e, e.sbuf + str_from_code(cp), true)); }
+Result(TomlEnc, SerialError) te_str_end(TomlEnc e) {
+    if (!e.streamed) { return Ok(e); }
+    // The text is read before the buffer is given up: it is what the leaf
+    // is made of.
+    Str text = e.sbuf;
+    TomlEnc at_end = te_sbuf(e, "", false);
+    if (at_end.in_key) { return Ok(te_of(at_end.leaves, at_end.path, at_end.stack, at_end.idx, TpKey(TomlText {.s = text}), false)); }
+    return Ok(te_leaf_str(at_end, text));
+}
+
+TomlEnc te_sbuf(TomlEnc e, Str text, Bool streamed) {
+    return TomlEnc {.leaves = e.leaves, .path = e.path, .stack = e.stack, .idx = e.idx, .pending = e.pending, .in_key = e.in_key, .keyed = e.keyed, .sbuf = text, .streamed = streamed};
+}
+Result(TomlEnc, SerialError) te_bytes_begin(TomlEnc e, Int len) { return Err(unsupported("bytes")); }
+Result(TomlEnc, SerialError) te_byte(TomlEnc e, Int b) { return Err(unsupported("bytes")); }
+Result(TomlEnc, SerialError) te_bytes_end(TomlEnc e) { return Err(unsupported("bytes")); }
+
+// An array's elements are leaves one index deeper; an empty one is a leaf
+// with an empty array, since it has no elements to carry it.
+// An array is a value under the key it was given, and its elements sit one
+// index deeper.
+Result(TomlEnc, SerialError) te_seq_begin(TomlEnc e, Int len) {
+    List(TomlSeg) below = if (tp_is_none(e.pending)) { e.path } else { e.path.concat([toml_seg_of(e.pending)]) };
+    TomlEnc e1 = te_of(e.leaves, below, e.stack.concat([TomlScope {.path = e.path, .idx = e.idx}]), 0, TpNone, false);
+    if (len == 0) { return Ok(te_leaf(e1, TArr(TomlArr {.items = []}))); }
+    return Ok(e1);
+}
+
+Result(TomlEnc, SerialError) te_seq_elem(TomlEnc e) {
+    return Ok(te_of(e.leaves, e.path, e.stack, e.idx + 1, TpIdx(TomlInt {.n = e.idx}), false));
+}
+
+Result(TomlEnc, SerialError) te_seq_end(TomlEnc e) { return te_table_end(e); }
+
+Result(TomlEnc, SerialError) te_map_begin(TomlEnc e, Int len) { return te_table_begin(e); }
+Result(TomlEnc, SerialError) te_map_key(TomlEnc e) { return Ok(te_of(e.leaves, e.path, e.stack, e.idx, TpKey(TomlText {.s = ""}), true)); }
+// The value that follows a key belongs to that key, so the name waits for
+// it: this is a no-op, and the value's own write takes the key.
+Result(TomlEnc, SerialError) te_map_value(TomlEnc e) { return Ok(e); }
+Result(TomlEnc, SerialError) te_map_end(TomlEnc e) { return te_table_end(e); }
+
+Result(TomlEnc, SerialError) te_struct_begin(TomlEnc e, Str name, Int len) { return te_table_begin(e); }
+Result(TomlEnc, SerialError) te_field(TomlEnc e, Str key) { return Ok(te_of(e.leaves, e.path, e.stack, e.idx, TpKey(TomlText {.s = key}), false)); }
+Result(TomlEnc, SerialError) te_struct_end(TomlEnc e) { return te_table_end(e); }
+
+// A unit variant is a table with a `type` key; a variant with a payload
+// adds a `value` key holding it.
+Result(TomlEnc, SerialError) te_unit_variant(TomlEnc e, Str enum_name, Int index, Str variant) {
+    return te_variant_table(e, variant, false);
+}
+
+Result(TomlEnc, SerialError) te_variant_begin(TomlEnc e, Str enum_name, Int index, Str variant) {
+    return te_variant_table(e, variant, true);
+}
+
+Result(TomlEnc, SerialError) te_variant_end(TomlEnc e) { return te_table_end(e); }
+
+// The variant's own table: `type`, then `value` when there is a payload.
+Result(TomlEnc, SerialError) te_variant_table(TomlEnc e, Str variant, Bool payload) {
+    TomlEnc e1 = te_of(e.leaves, e.path, e.stack.concat([e.path]), 0, TpKey(TomlText {.s = "type"}), false);
+    TomlEnc e2 = te_leaf_str(e1, variant);
+    if (!payload) { return te_variant_end(e2); }
+    return Ok(te_of(e2.leaves, e2.path, e2.stack, 0, TpKey(TomlText {.s = "value"}), false));
+}
+
+Bool te_human(TomlEnc e) { return true; }
+
+Encoder(TomlEnc) = {
+    .write_unit = te_unit, .write_bool = te_bool, .write_int = te_int, .write_uint = te_uint,
+    .write_i128 = te_i128, .write_u128 = te_u128, .write_float = te_float, .write_str = te_str,
+    .write_bytes = te_bytes, .write_none = te_none,
+    .write_str_begin = te_str_begin, .write_str_char = te_str_char, .write_str_end = te_str_end,
+    .write_bytes_begin = te_bytes_begin, .write_byte = te_byte, .write_bytes_end = te_bytes_end,
+    .write_some = te_some,
+    .write_seq_begin = te_seq_begin, .write_seq_elem = te_seq_elem, .write_seq_end = te_seq_end,
+    .write_map_begin = te_map_begin, .write_map_key = te_map_key, .write_map_value = te_map_value, .write_map_end = te_map_end,
+    .write_struct_begin = te_struct_begin, .write_field = te_field, .write_struct_end = te_struct_end,
+    .write_unit_variant = te_unit_variant, .write_variant_begin = te_variant_begin, .write_variant_end = te_variant_end,
+    .encodes_human_readable = te_human
+};
+
+// The `Dec(N)` verb is the framework's, so a decimal needs its own.
+@needs(Encode(T, TomlEnc))
+pub Result(Str, SerialError) to_toml(T x) {
+    TomlEnc e = encode(x, toml_encoder())?;
+    if (!e.keyed) { return Err(unsupported("a TOML document, whose top level is a table")); }
+    return Ok(toml_text(e));
+}
+
+// ─── The tree the leaves make ────────────────────────────────────────
+
+// The table the leaves [start, stop) hold, at depth `depth`.
+TomlValue toml_build(List(TomlLeaf) ls, Int depth, Int start, Int stop) {
+    Int d = toml_leaf_depth(ls, start);
+    if (depth >= d) { return ls[start].value; }
+    TomlSeg seg = toml_seg_at(ls, start, depth);
+    // Both a table and an array cover the whole span: the pairs and the
+    // elements inside it are what split the span up. A table written in
+    // braces is a value, so its pairs are marked inline.
+    if (seg_is_inline(seg)) { return TTable(toml_pairs_inlined(ls, depth, start, stop)); }
+    if (seg_is_key(seg)) { return TTable(toml_pairs(ls, depth, start, stop)); }
+    return TArr(TomlArr {.items = toml_elements(ls, depth, start, stop)});
+}
+
+// How deep a leaf's path goes.
+Int toml_leaf_depth(List(TomlLeaf) ls, Int i) {
+    if (i >= ls.len()) { return 0; }
+    return ls[i].path.len();
+}
+
+TomlSeg toml_seg_at(List(TomlLeaf) ls, Int i, Int depth) {
+    if (i >= ls.len() || depth >= ls[i].path.len()) { return seg_key(""); }
+    return ls[i].path[depth];
+}
+
+// Where the run of leaves that share a segment at this depth ends.
+Int toml_run_end(List(TomlLeaf) ls, Int depth, Int start, Int stop) {
+    if (start + 1 >= stop) { return stop; }
+    TomlSeg first = toml_seg_at(ls, start, depth);
+    return toml_run_from(ls, depth, start + 1, stop, first);
+}
+
+Int toml_run_from(List(TomlLeaf) ls, Int depth, Int i, Int stop, TomlSeg first) {
+    if (i >= stop) { return stop; }
+    if (!toml_same_seg(first, toml_seg_at(ls, i, depth))) { return i; }
+    return toml_run_from(ls, depth, i + 1, stop, first);
+}
+
+Bool toml_same_seg(TomlSeg a, TomlSeg b) {
+    if (seg_is_key(a)) { return seg_is_key(b) && seg_text(a) == seg_text(b); }
+    return seg_pos(a) == seg_pos(b);
+}
+
+// The table's pairs: one per key, each the value its leaves make.
+TomlTable toml_pairs(List(TomlLeaf) ls, Int depth, Int start, Int stop) { return toml_pairs_at(ls, depth, start, stop, tm_empty()); }
+
+TomlTable toml_pairs_at(List(TomlLeaf) ls, Int depth, Int i, Int stop, TomlTable acc) {
+    if (i >= stop) { return acc; }
+    Int run = toml_run_end(ls, depth, i, stop);
+    TomlValue v = toml_build(ls, depth + 1, i, run);
+    return toml_pairs_at(ls, depth, run, stop, tm_append(acc, TomlPair {.key = toml_key_name(ls, i, depth), .value = v}));
+}
+
+Str toml_key_name(List(TomlLeaf) ls, Int i, Int depth) { return seg_text(toml_seg_at(ls, i, depth)); }
+
+TomlTable toml_pairs_inlined(List(TomlLeaf) ls, Int depth, Int start, Int stop) {
+    TomlTable t = toml_pairs(ls, depth, start, stop);
+    return TomlTable {.pairs = t.pairs, .inline = true};
+}
+
+// The array's items: one per index, each the value its leaves make.
+List(TomlValue) toml_elements(List(TomlLeaf) ls, Int depth, Int start, Int stop) { return toml_elements_at(ls, depth, start, stop, []); }
+
+List(TomlValue) toml_elements_at(List(TomlLeaf) ls, Int depth, Int i, Int stop, List(TomlValue) acc) {
+    if (i >= stop) { return acc; }
+    Int run = toml_run_end(ls, depth, i, stop);
+    return toml_elements_at(ls, depth, run, stop, acc.concat([toml_build(ls, depth + 1, i, run)]));
+}
+
+// ─── Rendering ───────────────────────────────────────────────────────
+
+// The document as text: a table's own keys, then a section per sub-table.
+Str toml_render(TomlValue v, Str path) { return toml_render_table(tm_table(v), path, false); }
+
+// A pair whose value is a table, or an array of tables, is a section: the
+// keys go inside `[name]`, one per `[[name]]` element.
+Bool toml_is_section(TomlValue v) {
+    if (tm_is_table(v)) { return !tm_table(v).inline; }
+    if (tm_is_array(v)) { return tm_items(v).len() > 0 && toml_all_tables(tm_items(v), 0); }
+    return false;
+}
+
+Bool toml_all_tables(List(TomlValue) items, Int i) {
+    if (i >= items.len()) { return true; }
+    if (!tm_is_table(items[i])) { return false; }
+    return toml_all_tables(items, i + 1);
+}
+
+Str toml_render_table(TomlTable t, Str path, Bool last) {
+    return toml_render_keys(t, 0, path) + toml_render_subs(t, 0, path, last);
+}
+
+// The `key = value` lines of a table, with the full path in each key.
+Str toml_render_keys(TomlTable t, Int i, Str path) {
+    if (i >= t.pairs.len()) { return ""; }
+    TomlPair p = t.pairs[i];
+    Str one = if (toml_is_section(p.value)) {
+        ""
+    } else {
+        tm_key(p.key) + " = " + toml_value(p.value) + "\n"
+    };
+    return one + toml_render_keys(t, i + 1, path);
+}
+
+// A table written inside braces is a value; one written as a section is
+// not, and its keys go in the section instead.
+Bool toml_inline(TomlTable t) { return t.inline; }
+
+// A sub-table's section, or an array of tables' `[[name]]` sections.
+Str toml_render_subs(TomlTable t, Int i, Str path, Bool last) {
+    if (i >= t.pairs.len()) { return ""; }
+    TomlPair p = t.pairs[i];
+    Str here = toml_dotted(path, p.key);
+    Str one = if (tm_is_array(p.value)) {
+        toml_render_array(tm_items(p.value), 0, here, last)
+    } else if (tm_is_table(p.value)) {
+        "[" + here + "]\n" + toml_render_table(tm_table(p.value), here, last)
+    } else {
+        ""
+    };
+    return one + toml_render_subs(t, i + 1, path, last);
+}
+
+Str toml_render_array(List(TomlValue) items, Int i, Str path, Bool last) {
+    if (i >= items.len()) { return ""; }
+    TomlValue v = items[i];
+    Str one = if (tm_is_table(v)) { "[[" + path + "]]\n" + toml_render_table(tm_table(v), path, true) } else { "" };
+    return one + toml_render_array(items, i + 1, path, last);
+}
+
+// A path joined with dots, each key quoted when it has to be.
+Str toml_dotted(Str path, Str key) {
+    if (path == "") { return tm_key(key); }
+    return path + "." + tm_key(key);
+}
+
+Str toml_value(TomlValue v) { return toml_scalar_of(v); }
+
+Str toml_scalar_of(TomlValue v) {
+    return match v {
+        TStr(x) => tm_str(x.s),
+        TInt(x) => f"{x.n}",
+        TReal(x) => tm_float(x.n),
+        TBool(x) => f"{x.b}",
+        TArr(x) => toml_array_text(x.items, 0),
+        TTable(x) => toml_inline_table(x)
+    };
+}
+
+Str toml_array_text(List(TomlValue) items, Int i) {
+    if (i >= items.len()) { return "[]"; }
+    return "[" + toml_array_items(items, 0) + "]";
+}
+
+Str toml_array_items(List(TomlValue) items, Int i) {
+    if (i >= items.len()) { return ""; }
+    Str one = toml_value(items[i]);
+    if (i + 1 >= items.len()) { return one; }
+    return one + ", " + toml_array_items(items, i + 1);
+}
+
+Str toml_inline_table(TomlTable t) { return "{ " + toml_inline_pairs(t, 0) + "}"; }
+
+Str toml_inline_pairs(TomlTable t, Int i) {
+    if (i >= t.pairs.len()) { return ""; }
+    TomlPair p = t.pairs[i];
+    Str one = tm_key(p.key) + " = " + toml_value(p.value);
+    if (i + 1 >= t.pairs.len()) { return one; }
+    return one + ", " + toml_inline_pairs(t, i + 1);
+}
+
+// ─── The decoder ─────────────────────────────────────────────────────
+
+// An open container: a table's remaining keys, an array's remaining items,
+// or a string's remaining code points.
+type TomlFrame = TfKeys(TomlCursor) | TfItems(TomlList);
+
+type TomlCursor = { TomlTable t; Int at; };
+type TomlList = { List(TomlValue) items; Int at; };
+
+// A parsed document, and where the decoder is in it. `taken` is the root
+// table's keys read so far, which is how a struct or a map walks them.
+// Two things wait between one read and the next. `mkey` is a map's key: an
+// element's name is the key, and the framework reads it as a value, so the
+// name is held back for that one read. `pval` is a struct field's value:
+// read_field names the pair and the value is the read that follows, so the
+// value it read is held for that.
+type TomlDec = {
+    TomlTable root;
+    Int taken;
+    List(TomlFrame) open;
+    Int payloads;
+    Int vmaps;
+    Int mkey;
+    Bool pval_ok;
+    TomlValue pval;
+    Str sbuf;  // a string being pulled one code point at a time
+    Int spos;
+};
+
+pub TomlDec toml_decoder(TomlTable root) { return TomlDec {.root = root, .taken = 0, .open = [], .payloads = 0, .vmaps = 0, .mkey = 0, .pval_ok = false, .pval = TTable(tm_empty()), .sbuf = "", .spos = 0}; }
+
+TomlDec td_of(TomlTable root, Int taken, List(TomlFrame) open, Int payloads, Int vmaps) {
+    return TomlDec {.root = root, .taken = taken, .open = open, .payloads = payloads, .vmaps = vmaps, .mkey = 0, .pval_ok = false, .pval = TTable(tm_empty()), .sbuf = "", .spos = 0};
+}
+
+TomlDec td_mkey(TomlDec d, Int on) { return TomlDec {.root = d.root, .taken = d.taken, .open = d.open, .payloads = d.payloads, .vmaps = d.vmaps, .mkey = on, .pval_ok = false, .pval = TTable(tm_empty()), .sbuf = d.sbuf, .spos = d.spos}; }
+
+// A field's value, waiting for the read that follows its name.
+TomlDec td_pval(TomlDec d, TomlValue v) { return TomlDec {.root = d.root, .taken = d.taken, .open = d.open, .payloads = d.payloads, .vmaps = d.vmaps, .mkey = 0, .pval_ok = true, .pval = v, .sbuf = d.sbuf, .spos = d.spos}; }
+
+TomlDec td_no_pval(TomlDec d) { return TomlDec {.root = d.root, .taken = d.taken, .open = d.open, .payloads = d.payloads, .vmaps = d.vmaps, .mkey = d.mkey, .pval_ok = false, .pval = TTable(tm_empty()), .sbuf = d.sbuf, .spos = d.spos}; }
+
+TomlDec td_push(TomlDec d, TomlFrame f) { return td_of(d.root, d.taken, d.open.concat([f]), d.payloads, d.vmaps); }
+
+TomlDec td_pop(TomlDec d) {
+    Int k = d.open.len();
+    if (k == 0) { return d; }
+    return td_of(d.root, d.taken, d.open[0..k - 1], d.payloads, d.vmaps);
+}
+
+// The cursor of the open table, or the root's when nothing is open.
+TomlCursor td_keys(TomlDec d) {
+    if (d.open.len() == 0) { return TomlCursor {.t = d.root, .at = d.taken}; }
+    TomlFrame f = d.open[d.open.len() - 1];
+    TomlCursor c = match f { TfKeys(x) => x, _ => TomlCursor {.t = d.root, .at = d.taken} };
+    return c;
+}
+
+// The open table's own cursor moves; the root's, which `taken` holds, is
+// not touched, so a table inside a table inside the root is not confused
+// with the root.
+TomlDec td_set_keys(TomlDec d, TomlCursor c) {
+    if (d.open.len() == 0) { return td_of(d.root, c.at, d.open, d.payloads, d.vmaps); }
+    Int k = d.open.len() - 1;
+    List(TomlFrame) open = d.open[0..k].concat([TfKeys(c)]);
+    return td_of(d.root, d.taken, open, d.payloads, d.vmaps);
+}
+
+// The value of the pair whose name was just read: the name is the pair's
+// key, and the value is what the pair holds, so the cursor steps over it.
+Result(Parsed(TomlValue, TomlDec), SerialError) td_mkey_value(TomlDec d) {
+    TomlCursor c = td_keys(d);
+    if (c.at >= c.t.pairs.len()) { return Err(syntax_error("a map value is missing")); }
+    return parsed(tm_at(c.t, c.at), td_mkey(td_set_keys(d, TomlCursor {.t = c.t, .at = c.at + 1}), 0));
+}
+
+// The value of the pair whose name was read, as a string: the same read
+// as any other value, and the same step over the name.
+Result(Parsed(Str, TomlDec), SerialError) td_mkey_text(TomlDec d) {
+    Result(Parsed(TomlValue, TomlDec), SerialError) n = td_mkey_value(d);
+    if (Ok(x) = n) {
+        if (!tm_is_text(x.value)) { return Err(invalid_type("a string", tm_kind(x.value))); }
+        return parsed(tm_text(x.value), x.rest);
+    }
+    if (Err(e) = n) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+// Whether a table is open to name keys of.
+Bool td_has_keys(TomlDec d) {
+    if (d.open.len() == 0) { return false; }
+    return tm_is_keys(d.open[d.open.len() - 1]);
+}
+
+// The next value the container owes a verb: the next key's value of the
+// open table, the next item of the open array, or the root table itself.
+Result(Parsed(TomlValue, TomlDec), SerialError) td_next(TomlDec d) {
+    if (d.pval_ok) { return parsed(d.pval, td_no_pval(d)); }
+    if (d.mkey != 0) { return td_mkey_value(d); }
+    if (d.open.len() == 0) {
+        if (d.taken > 0) { return Err(syntax_error("the document is already read")); }
+        return parsed(TTable(d.root), td_of(d.root, 1, d.open, d.payloads, d.vmaps));
+    }
+    TomlFrame f = d.open[d.open.len() - 1];
+    if (d.open.len() == 0 || tm_is_keys(f)) { return td_next_key(d, f); }
+    return td_next_item(d, f);
+}
+
+Bool tm_is_keys(TomlFrame f) { return match f { TfKeys(_) => true, _ => false }; }
+
+Bool tm_is_items(TomlFrame f) { return match f { TfItems(_) => true, _ => false }; }
+
+Result(Parsed(TomlValue, TomlDec), SerialError) td_next_key(TomlDec d, TomlFrame f) {
+    TomlCursor c = td_keys(d);
+    if (c.at >= c.t.pairs.len()) { return Err(custom_error("the table has no more keys")); }
+    return parsed(tm_at(c.t, c.at), td_set_keys(d, TomlCursor {.t = c.t, .at = c.at + 1}));
+}
+
+Result(Parsed(TomlValue, TomlDec), SerialError) td_next_item(TomlDec d, TomlFrame f) {
+    TomlList l = td_items_of(f);
+    if (l.at >= l.items.len()) { return Err(custom_error("the array has no more items")); }
+    return parsed(l.items[l.at], td_set_items(d, TomlList {.items = l.items, .at = l.at + 1}));
+}
+
+TomlList td_items_of(TomlFrame f) { return match f { TfItems(x) => x, _ => TomlList {.items = [], .at = 0} }; }
+
+TomlDec td_set_items(TomlDec d, TomlList l) {
+    Int k = d.open.len() - 1;
+    List(TomlFrame) open = d.open[0..k].concat([TfItems(l)]);
+    return td_of(d.root, d.taken, open, d.payloads, d.vmaps);
+}
+
+// A value of the kind asked for, with what is left in place.
+Result(Parsed(TomlValue, TomlDec), SerialError) td_take(TomlDec d, Str want) {
+    Result(Parsed(TomlValue, TomlDec), SerialError) n = td_next(d);
+    if (Err(e) = n) { return Err(e); }
+    return match n { Ok(x) => td_want(x.value, x.rest, want), Err(_) => Err(custom_error("unreachable")) };
+}
+
+Result(Parsed(TomlValue, TomlDec), SerialError) td_want(TomlValue v, TomlDec d, Str want) {
+    return parsed(v, d);
+}
+
+// ─── Scalars ─────────────────────────────────────────────────────────
+
+Result(Parsed(Int, TomlDec), SerialError) td_int(TomlDec d) {
+    Result(Parsed(TomlValue, TomlDec), SerialError) n = td_take(d, "an integer");
+    if (Ok(x) = n) { return td_as_int(x.value, x.rest); }
+    if (Err(e) = n) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+Result(Parsed(Int, TomlDec), SerialError) td_as_int(TomlValue v, TomlDec d) {
+    if (tm_is_text(v) || tm_is_table(v) || tm_is_array(v)) { return Err(invalid_type("an integer", tm_kind(v))); }
+    if (!toml_is_int(v)) { return Err(invalid_type("an integer", tm_kind(v))); }
+    return parsed(tm_int(v), d);
+}
+
+pub Bool toml_is_int(TomlValue v) { return match v { TInt(_) => true, _ => false }; }
+pub Bool toml_is_real(TomlValue v) { return match v { TReal(_) => true, _ => false }; }
+pub Bool toml_is_flag(TomlValue v) { return match v { TBool(_) => true, _ => false }; }
+
+Result(Parsed(UInt(64), TomlDec), SerialError) td_uint(TomlDec d) {
+    Parsed(Int, TomlDec) n = td_int(d)?;
+    if (n.value < 0) { return Err(invalid_value(f"{n.value}", "an unsigned integer")); }
+    return parsed((UInt(64))n.value, n.rest);
+}
+
+Result(Parsed(Int(128), TomlDec), SerialError) td_i128(TomlDec d) {
+    Parsed(Int, TomlDec) n = td_int(d)?;
+    return parsed((Int(128))n.value, n.rest);
+}
+
+Result(Parsed(UInt(128), TomlDec), SerialError) td_u128(TomlDec d) {
+    Parsed(Int, TomlDec) n = td_int(d)?;
+    if (n.value < 0) { return Err(invalid_value(f"{n.value}", "an unsigned 128-bit integer")); }
+    return parsed(u128(n.value), n.rest);
+}
+
+Result(Parsed(Float, TomlDec), SerialError) td_float(TomlDec d) {
+    Result(Parsed(TomlValue, TomlDec), SerialError) n = td_take(d, "a float");
+    if (Ok(x) = n) {
+        if (toml_is_int(x.value)) { return parsed((Float)tm_int(x.value), x.rest); }
+        if (toml_is_real(x.value)) { return parsed(tm_real(x.value), x.rest); }
+        return Err(invalid_type("a float", tm_kind(x.value)));
+    }
+    if (Err(e) = n) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+Result(Parsed(Bool, TomlDec), SerialError) td_bool(TomlDec d) {
+    Result(Parsed(TomlValue, TomlDec), SerialError) n = td_take(d, "a boolean");
+    if (Ok(x) = n) {
+        if (!toml_is_flag(x.value)) { return Err(invalid_type("a boolean", tm_kind(x.value))); }
+        return parsed(tm_flag(x.value), x.rest);
+    }
+    if (Err(e) = n) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+// ─── Strings and bytes ───────────────────────────────────────────────
+
+Result(Parsed(Str, TomlDec), SerialError) td_str(TomlDec d) {
+    if (d.mkey == 1) { return td_map_key(d); }
+    if (d.mkey == 2) { return td_mkey_text(d); }
+    Result(Parsed(TomlValue, TomlDec), SerialError) n = td_take(d, "a string");
+    if (Ok(x) = n) {
+        if (!tm_is_text(x.value)) { return Err(invalid_type("a string", tm_kind(x.value))); }
+        return parsed(tm_text(x.value), x.rest);
+    }
+    if (Err(e) = n) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+// What the next element of an open array is, which is what a peek inside
+// an array has to answer.
+Result(Parsed(Peek, TomlDec), SerialError) td_peek_item(TomlDec d) {
+    TomlList l = td_items_of(d.open[d.open.len() - 1]);
+    if (l.at >= l.items.len()) { return Err(syntax_error("the array has no more items")); }
+    return parsed(toml_peek_of(l.items[l.at]), d);
+}
+
+// A map key: the name of the pair the cursor is on. The cursor stays where
+// it is, since the value that follows is the one the pair holds, and
+// `td_mkey_value` is the read that steps over the name.
+Result(Parsed(Str, TomlDec), SerialError) td_map_key(TomlDec d) {
+    TomlCursor c = td_keys(d);
+    if (c.at >= c.t.pairs.len()) { return Err(syntax_error("a map key is missing")); }
+    return parsed(tm_key_at(c.t, c.at), td_mkey(d, 2));
+}
+
+Result(Parsed(Int, TomlDec), SerialError) td_str_begin(TomlDec d) {
+    Result(Parsed(TomlValue, TomlDec), SerialError) n = td_take(d, "a string");
+    if (Ok(x) = n) {
+        if (!tm_is_text(x.value)) { return Err(invalid_type("a string", tm_kind(x.value))); }
+        return parsed(str_len(tm_text(x.value)), td_sbuf(x.rest, tm_text(x.value), 0));
+    }
+    if (Err(e) = n) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+// The next code point, or -1 once the string is done, which also lets go of
+// the text it was holding. The cursor lives in the decoder rather than in
+// the frame list, because a frame on top of the keys would hide the table
+// the field walk is in.
+Result(Parsed(Int, TomlDec), SerialError) td_str_next(TomlDec d) {
+    if (d.spos >= str_len(d.sbuf)) { return parsed(0 - 1, td_sbuf(d, "", 0)); }
+    return parsed(str_char_at(d.sbuf, d.spos), td_sbuf(d, d.sbuf, d.spos + 1));
+}
+
+// With a string held for td_str_next to pull code points from.
+TomlDec td_sbuf(TomlDec d, Str text, Int at) {
+    return TomlDec {.root = d.root, .taken = d.taken, .open = d.open, .payloads = d.payloads, .vmaps = d.vmaps, .mkey = d.mkey, .pval_ok = d.pval_ok, .pval = d.pval, .sbuf = text, .spos = at};
+}
+
+Result(Parsed(List(Int), TomlDec), SerialError) td_bytes(TomlDec d) { return Err(unsupported("bytes")); }
+Result(Parsed(Int, TomlDec), SerialError) td_bytes_begin(TomlDec d) { return Err(unsupported("bytes")); }
+Result(Parsed(Int, TomlDec), SerialError) td_bytes_next(TomlDec d) { return Err(unsupported("bytes")); }
+Result(TomlDec, SerialError) td_unit(TomlDec d) { return Err(unsupported("a unit value, which TOML has no spelling for")); }
+
+// TOML has no null, so an option is either there or the field was absent.
+Result(Parsed(Bool, TomlDec), SerialError) td_option(TomlDec d) { return parsed(true, d); }
+
+// ─── Tables, sequences and maps ──────────────────────────────────────
+
+// A struct or a map is a table; the count is how many keys it holds.
+Result(Parsed(Int, TomlDec), SerialError) td_table_begin(TomlDec d) {
+    Result(Parsed(TomlValue, TomlDec), SerialError) n = td_next(d);
+    if (Ok(x) = n) {
+        if (!tm_is_table(x.value)) { return Err(invalid_type("a table", tm_kind(x.value))); }
+        TomlTable t = tm_table(x.value);
+        return parsed(t.pairs.len(), td_push(x.rest, TfKeys(TomlCursor {.t = t, .at = 0})));
+    }
+    if (Err(e) = n) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+Result(Parsed(Int, TomlDec), SerialError) td_seq_begin(TomlDec d) {
+    Result(Parsed(TomlValue, TomlDec), SerialError) n = td_next(d);
+    if (Ok(x) = n) {
+        if (!tm_is_array(x.value)) { return Err(invalid_type("an array", tm_kind(x.value))); }
+        List(TomlValue) items = tm_items(x.value);
+        return parsed(items.len(), td_push(x.rest, TfItems(TomlList {.items = items, .at = 0})));
+    }
+    if (Err(e) = n) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+// The next key of the open table, matched against the names the type
+// knows; the value follows.
+Result(Parsed(FieldKey, TomlDec), SerialError) td_field(TomlDec d, List(Str) fields) {
+    if (!td_has_keys(d)) { return Err(custom_error("no table is open")); }
+    TomlCursor c = td_keys(d);
+    if (c.at >= c.t.pairs.len()) { return parsed(EndOfFields, td_pop(d)); }
+    Str key = tm_key_at(c.t, c.at);
+    Int idx = name_index(fields, key);
+    FieldKey k = if (idx < 0) { UnknownField(key) } else { KnownField(idx) };
+    TomlValue v = tm_at(c.t, c.at);
+    return parsed(k, td_pval(td_set_keys(d, TomlCursor {.t = c.t, .at = c.at + 1}), v));
+}
+
+// Whether another element is there. Saying yes does not consume it: the
+// read of the element is what takes it, and `td_next_item` counts it.
+Result(Parsed(Bool, TomlDec), SerialError) td_seq_next(TomlDec d) {
+    if (d.open.len() == 0) { return Err(custom_error("no array is open")); }
+    TomlFrame f = d.open[d.open.len() - 1];
+    TomlList l = td_items_of(f);
+    if (l.at >= l.items.len()) { return parsed(false, td_pop(d)); }
+    return parsed(true, d);
+}
+
+// The next entry: its name is the key, which the read of the key takes, so
+// the cursor waits for it.
+Result(Parsed(Bool, TomlDec), SerialError) td_map_next(TomlDec d) {
+    if (!td_has_keys(d)) { return Err(custom_error("no table is open")); }
+    TomlCursor c = td_keys(d);
+    if (c.at >= c.t.pairs.len()) { return parsed(false, td_pop(d)); }
+    return parsed(true, td_mkey(d, 1));
+}
+
+Result(TomlDec, SerialError) td_map_value(TomlDec d) { return Ok(d); }
+Result(TomlDec, SerialError) td_struct_begin(TomlDec d, Str name, List(Str) fields) { return td_begin_table(d); }
+
+Result(TomlDec, SerialError) td_begin_table(TomlDec d) {
+    Result(Parsed(TomlValue, TomlDec), SerialError) n = td_next(d);
+    if (Ok(x) = n) {
+        if (!tm_is_table(x.value)) { return Err(invalid_type("a table", tm_kind(x.value))); }
+        TomlTable t = tm_table(x.value);
+        return Ok(td_push(x.rest, TfKeys(TomlCursor {.t = t, .at = 0})));
+    }
+    if (Err(e) = n) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+// ─── Variants ────────────────────────────────────────────────────────
+
+// A variant is a table with a `type` key naming it and, when there is a
+// payload, a `value` key holding it.
+Result(Parsed(Str, TomlDec), SerialError) td_variant_name_at(TomlDec d) {
+    Result(Parsed(TomlValue, TomlDec), SerialError) n = td_next(d);
+    if (Err(e) = n) { return Err(e); }
+    if (Ok(x) = n) {
+        if (!tm_is_table(x.value)) { return Err(invalid_type("an enum variant", tm_kind(x.value))); }
+        TomlTable t = tm_table(x.value);
+        Int k = tm_find(t, "type", 0, -1);
+        if (k < 0) { return Err(missing_field("type")); }
+        if (!tm_is_text(tm_at(t, k))) { return Err(invalid_type("a string", tm_kind(tm_at(t, k)))); }
+        return parsed(tm_text(tm_at(t, k)), td_push(x.rest, TfKeys(TomlCursor {.t = t, .at = 0})));
+    }
+    return Err(custom_error("unreachable"));
+}
+
+Result(Parsed(Int, TomlDec), SerialError) td_variant(TomlDec d, Str enum_name, List(Str) variants) {
+    Result(Parsed(Str, TomlDec), SerialError) n = td_variant_name_at(d);
+    if (Ok(x) = n) {
+        Int idx = name_index(variants, x.value);
+        if (idx < 0) { return Err(unknown_variant(x.value, variants)); }
+        return parsed(idx, td_skip_type(x.rest));
+    }
+    if (Err(e) = n) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+// The name has been read; the payload, if any, is the next value.
+TomlDec td_skip_type(TomlDec d) {
+    TomlCursor c = td_keys(d);
+    return td_set_keys(d, TomlCursor {.t = c.t, .at = c.at + 1});
+}
+
+Result(Parsed(VariantName, TomlDec), SerialError) td_variant_name(TomlDec d) {
+    Result(Parsed(Str, TomlDec), SerialError) n = td_variant_name_at(d);
+    if (Ok(x) = n) { return parsed(VariantName {.enum_name = "", .index = 0 - 1, .name = x.value, .has_payload = td_has_value(x.rest)}, td_skip_type(x.rest)); }
+    if (Err(e) = n) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+Bool td_has_value(TomlDec d) {
+    TomlCursor c = td_keys(d);
+    return tm_find(c.t, "value", 0, -1) >= 0;
+}
+
+// The payload's value follows; the variant's table stays open for
+// read_variant_end to close.
+Result(TomlDec, SerialError) td_variant_payload(TomlDec d) {
+    if (d.open.len() == 0) { return Err(custom_error("no variant is open")); }
+    return Ok(d);
+}
+
+// A unit variant has no payload, and nothing else will close its table:
+// the framework's unit path ends here.
+Result(TomlDec, SerialError) td_variant_unit(TomlDec d) { return Ok(td_pop(d)); }
+
+Result(TomlDec, SerialError) td_variant_end(TomlDec d) { return Ok(td_pop(d)); }
+
+// ─── Untyped reads ───────────────────────────────────────────────────
+
+Result(Parsed(Peek, TomlDec), SerialError) td_peek(TomlDec d) {
+    if (d.pval_ok) { return parsed(toml_peek_of(d.pval), d); }
+    if (!td_has_keys(d) && d.open.len() > 0) { return td_peek_item(d); }
+    if (d.mkey == 1) { return parsed(PeekStr, d); }
+    if (d.mkey == 2) {
+        TomlCursor c = td_keys(d);
+        if (c.at >= c.t.pairs.len()) { return Err(syntax_error("a map value is missing")); }
+        return parsed(toml_peek_of(tm_at(c.t, c.at)), d);
+    }
+    if (d.open.len() == 0 && d.taken == 0) { return parsed(PeekMap, d); }
+    TomlCursor c = td_keys(d);
+    if (c.at >= c.t.pairs.len()) { return Err(syntax_error("no value left")); }
+    return parsed(toml_peek_of(tm_at(c.t, c.at)), d);
+}
+
+Peek toml_peek_of(TomlValue v) {
+    if (tm_is_text(v)) { return PeekStr; }
+    if (toml_is_int(v)) { return PeekInt; }
+    if (toml_is_real(v)) { return PeekFloat; }
+    if (toml_is_flag(v)) { return PeekBool; }
+    if (tm_is_array(v)) { return PeekSeq; }
+    return PeekMap;
+}
+
+Result(TomlDec, SerialError) td_skip(TomlDec d) {
+    if (d.pval_ok) { return Ok(td_no_pval(d)); }
+    if (d.mkey != 0) {
+        TomlCursor c = td_keys(d);
+        return Ok(td_mkey(td_set_keys(d, TomlCursor {.t = c.t, .at = c.at + 1}), 0));
+    }
+    Result(Parsed(TomlValue, TomlDec), SerialError) n = td_next(d);
+    if (Ok(x) = n) { return Ok(x.rest); }
+    if (Err(e) = n) { return Err(e); }
+    return Err(custom_error("unreachable"));
+}
+
+Result(TomlDec, SerialError) td_end(TomlDec d) {
+    if (d.open.len() > 0) { return Err(syntax_error("a container is still open")); }
+    return Ok(d);
+}
+
+Bool td_human(TomlDec d) { return true; }
+
+Decoder(TomlDec) = {
+    .read_unit = td_unit, .read_bool = td_bool, .read_int = td_int, .read_uint = td_uint,
+    .read_i128 = td_i128, .read_u128 = td_u128, .read_float = td_float, .read_str = td_str,
+    .read_bytes = td_bytes, .read_option = td_option,
+    .read_str_begin = td_str_begin, .read_str_next = td_str_next,
+    .read_bytes_begin = td_bytes_begin, .read_bytes_next = td_bytes_next,
+    .read_seq_begin = td_seq_begin, .read_seq_next = td_seq_next, .read_map_begin = td_table_begin,
+    .read_map_next = td_map_next, .read_map_value = td_map_value, .read_struct_begin = td_struct_begin,
+    .read_field = td_field, .read_variant = td_variant, .read_variant_name = td_variant_name,
+    .read_variant_unit = td_variant_unit, .read_variant_payload = td_variant_payload,
+    .read_variant_end = td_variant_end, .read_skip = td_skip, .read_peek = td_peek, .read_end = td_end,
+    .decodes_human_readable = td_human
+};
+
+// ─── Entry points ────────────────────────────────────────────────────
+
+@needs(Decode(T, TomlDec))
+pub Result(T, SerialError) from_toml(Str in) {
+    Result(TomlTable, SerialError) r = toml_parse(in);
+    if (Err(e) = r) { return Err(e); }
+    return match r { Ok(t) => decode_value(toml_decoder(t)), Err(e2) => Err(e2) };
+}

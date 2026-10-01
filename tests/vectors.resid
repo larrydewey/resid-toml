@@ -1,0 +1,280 @@
+// vectors.resid — the documents the TOML specification writes out, parsed
+// and read back, and the values this package writes for them.
+
+import "../src/toml.resid";
+import "check.resid";
+
+// ─── Reading a value out of a document ───────────────────────────────
+
+// The value at a path in a document: `a.b` for a key, `a[0]` for an index.
+Str look(Str doc, Str path) {
+    Result(TomlTable, SerialError) r = toml_parse(doc);
+    if (Err(e) = r) { return "parse: " + error_text(e); }
+    if (Ok(t) = r) { return look_at(t, path, 0); }
+    return "unreachable";
+}
+
+// One segment at a time: a key, then either a `.` and another key or a
+// `[n]` index into the value the key held.
+Str look_at(TomlTable t, Str path, Int from) {
+    if (from >= str_len(path)) { return "?"; }
+    Int stop = seg_stop(path, from);
+    Str key = str_slice(path, from, stop);
+    Int at = tm_find(t, key, 0, -1);
+    if (at < 0) { return "no key " + key; }
+    if (stop >= str_len(path)) { return value_text(tm_at(t, at)); }
+    if (str_char_at(path, stop) == 91) { return look_index(tm_at(t, at), path, stop); }
+    return look_at(tm_table(tm_at(t, at)), path, stop + 1);
+}
+
+// Where a key ends: at a `.` that steps into a table, or at a `[` that
+// indexes the value the key held.
+Int seg_stop(Str path, Int from) {
+    Int dot = str_index_of(path, ".", from);
+    Int open = str_index_of(path, "[", from);
+    if (dot < 0) { return seg_open(open, str_len(path)); }
+    return seg_open(open, seg_clamp(dot, str_len(path)));
+}
+
+Int seg_open(Int open, Int stop) { if (open >= 0 && open < stop) { return open; } return stop; }
+
+Int seg_clamp(Int at, Int stop) { if (at < 0) { return stop; } return at; }
+
+// An index into an array, then the rest of the path inside that element.
+Str look_index(TomlValue v, Str path, Int from) {
+    Int close = str_index_of(path, "]", from);
+    if (close < 0) { return "no ]"; }
+    Int idx = digits_of(str_slice(path, from + 1, close), 0, 0);
+    List(TomlValue) items = tm_items(v);
+    if (idx >= items.len()) { return "no item " + f"{idx}"; }
+    if (close + 1 >= str_len(path)) { return value_text(items[idx]); }
+    return look_at(tm_table(items[idx]), path, close + 2);
+}
+
+// The digits of an index, so a path can be written with them.
+Int digits_of(Str s, Int i, Int acc) {
+    if (i >= str_len(s)) { return acc; }
+    Int c = str_char_at(s, i);
+    if (c < 48 || c > 57) { return acc; }
+    return digits_of(s, i + 1, acc * 10 + (c - 48));
+}
+
+// A value as the text it would be written as.
+Str value_text(TomlValue v) {
+    if (tm_is_text(v)) { return tm_str(tm_text(v)); }
+    if (toml_is_int(v)) { return f"{tm_int(v)}"; }
+    if (toml_is_real(v)) { return tm_float(tm_real(v)); }
+    if (toml_is_flag(v)) { return f"{tm_flag(v)}"; }
+    if (tm_is_array(v)) { return array_text(tm_items(v), 0); }
+    if (tm_is_table(v)) { return table_text(tm_table(v), 0); }
+    return "?";
+}
+
+Str array_text(List(TomlValue) items, Int i) {
+    if (i >= items.len()) { return "[]"; }
+    return "[" + array_items(items, 0) + "]";
+}
+
+Str array_items(List(TomlValue) items, Int i) {
+    if (i >= items.len()) { return ""; }
+    Str one = value_text(items[i]);
+    if (i + 1 >= items.len()) { return one; }
+    return one + ", " + array_items(items, i + 1);
+}
+
+Str table_text(TomlTable t, Int i) {
+    if (i >= t.pairs.len()) { return "{}"; }
+    return "{ " + table_pairs(t, 0) + " }";
+}
+
+Str table_pairs(TomlTable t, Int i) {
+    if (i >= t.pairs.len()) { return ""; }
+    Str one = tm_key(t.pairs[i].key) + " = " + value_text(t.pairs[i].value);
+    if (i + 1 >= t.pairs.len()) { return one; }
+    return one + ", " + table_pairs(t, i + 1);
+}
+
+// ─── The model for the encoding side ────────────────────────────────
+
+type Point = { Int x; Int y; };
+
+@needs(Encoder(F))
+Result(F, SerialError) enc_point(Point v, F s) {
+    F s1 = write_struct_begin(s, "Point", 2)?;
+    F s2 = write_named(s1, "x", v.x)?;
+    F s3 = write_named(s2, "y", v.y)?;
+    return write_struct_end(s3);
+}
+Encode(Point, F) = enc_point;
+
+type Inner = { Str name; Int n; };
+
+@needs(Encoder(F))
+Result(F, SerialError) enc_inner(Inner v, F s) {
+    F s1 = write_struct_begin(s, "Inner", 2)?;
+    F s2 = write_named(s1, "name", v.name)?;
+    F s3 = write_named(s2, "n", v.n)?;
+    return write_struct_end(s3);
+}
+Encode(Inner, F) = enc_inner;
+
+type Outer = { Str title; List(Inner) items; List(Str) tags; };
+
+@needs(Encoder(F))
+Result(F, SerialError) enc_outer(Outer v, F s) {
+    F s1 = write_struct_begin(s, "Outer", 3)?;
+    F s2 = write_named(s1, "title", v.title)?;
+    F s3 = write_named(s2, "items", v.items)?;
+    F s4 = write_named(s3, "tags", v.tags)?;
+    return write_struct_end(s4);
+}
+Encode(Outer, F) = enc_outer;
+
+type Quoted = { Str a; Str b; Str c; };
+
+@needs(Encoder(F))
+Result(F, SerialError) enc_quoted(Quoted v, F s) {
+    F s1 = write_struct_begin(s, "Quoted", 3)?;
+    F s2 = write_named(s1, "a", v.a)?;
+    F s3 = write_named(s2, "b", v.b)?;
+    F s4 = write_named(s3, "c", v.c)?;
+    return write_struct_end(s4);
+}
+Encode(Quoted, F) = enc_quoted;
+
+type Kinds = { Str s; Int n; Float f; Bool b; };
+
+@needs(Encoder(F))
+Result(F, SerialError) enc_kinds(Kinds v, F s) {
+    F s1 = write_struct_begin(s, "Kinds", 4)?;
+    F s2 = write_named(s1, "s", v.s)?;
+    F s3 = write_named(s2, "n", v.n)?;
+    F s4 = write_named(s3, "f", v.f)?;
+    F s5 = write_named(s4, "b", v.b)?;
+    return write_struct_end(s5);
+}
+Encode(Kinds, F) = enc_kinds;
+
+Str doc(Result(Str, SerialError) r) {
+    if (Err(e) = r) { return "encode: " + error_text(e); }
+    if (Ok(s) = r) { return s; }
+    return "unreachable";
+}
+
+Int main() {
+    // ─── Keys and values ──────────────────────────────────────────────
+    // A bare key, a quoted key, and a dotted key that makes a table.
+    check_text("key/bare", look("title = \"TOML\"\n", "title"), "\"TOML\"");
+    check_text("key/quoted", look("\"a b\" = 1\n", "a b"), "1");
+    check_text("key/literal", look("'a b' = 2\n", "a b"), "2");
+    check_text("key/dotted", look("a.b.c = 3\n", "a.b.c"), "3");
+    check_text("key/dotted table", look("a.b.c = 3\n", "a"), "{ b = { c = 3 } }");
+
+    // Comments, and blank lines between the pairs.
+    check_text("comment/end", look("n = 1 # one\n", "n"), "1");
+    check_text("comment/own line", look("# a comment\n\nn = 2\n", "n"), "2");
+    check_text("comment/after table", look("[t] # a table\nn = 3\n", "t.n"), "3");
+
+    // ─── Tables ───────────────────────────────────────────────────────
+    check_text("table/one", look("[a]\nn = 1\n", "a.n"), "1");
+    check_text("table/nested", look("[a.b]\nn = 1\n", "a.b.n"), "1");
+    check_text("table/dotted header", look("[a.b.c]\nn = 1\n", "a.b.c.n"), "1");
+    check_text("table/quoted header", look("[\"a b\"]\nn = 1\n", "a b.n"), "1");
+    // A key may come before the table it belongs to.
+    check_text("table/out of order", look("[b]\ny = 2\n[a]\nx = 1\n", "a.x"), "1");
+    check_text("table/shared", look("[a]\nx = 1\n[b]\ny = 2\n[a.c]\nz = 3\n", "a.c.z"), "3");
+
+    // ─── Arrays of tables ─────────────────────────────────────────────
+    check_text("array of tables/one", look("[[a]]\nn = 1\n", "a[0].n"), "1");
+    check_text("array of tables/two", look("[[a]]\nn = 1\n[[a]]\nn = 2\n", "a[1].n"), "2");
+    check_text("array of tables/nested", look("[[a]]\nn = 1\n[[a.b]]\nm = 2\n[[a.b]]\nn = 3\n", "a[0].b[1].n"), "3");
+    check_text("array of tables/under table", look("[a]\n[[a.b]]\nn = 1\n[[a.b]]\nn = 2\n", "a.b[1].n"), "2");
+
+    // ─── Arrays ───────────────────────────────────────────────────────
+    check_text("array/empty", look("a = []\n", "a"), "[]");
+    check_text("array/ints", look("a = [1, 2, 3]\n", "a"), "[1, 2, 3]");
+    check_text("array/mixed", look("a = [1, \"x\", true]\n", "a"), "[1, \"x\", true]");
+    check_text("array/nested", look("a = [[1, 2], [3]]\n", "a"), "[[1, 2], [3]]");
+    check_text("array/trailing comma", look("a = [1, 2, ]\n", "a"), "[1, 2]");
+    check_text("array/newlines", look("a = [\n  1,\n  2,\n]\n", "a"), "[1, 2]");
+    check_text("array/of tables", look("a = [{ b = 1 }, { b = 2 }]\n", "a[1].b"), "2");
+
+    // ─── Inline tables ────────────────────────────────────────────────
+    check_text("inline/empty", look("a = {}\n", "a"), "{}");
+    check_text("inline/one", look("a = { b = 1 }\n", "a.b"), "1");
+    check_text("inline/keys", look("a = { b = 1, c = 2 }\n", "a"), "{ b = 1, c = 2 }");
+    check_text("inline/trailing comma", look("a = { b = 1, }\n", "a.b"), "1");
+    check_text("inline/nested", look("a = { b = { c = 1 } }\n", "a.b.c"), "1");
+    check_text("inline/array", look("a = { b = [1, 2] }\n", "a.b"), "[1, 2]");
+
+    // ─── Strings ──────────────────────────────────────────────────────
+    check_text("string/basic", look("a = \"hello\"\n", "a"), "\"hello\"");
+    check_text("string/empty", look("a = \"\"\n", "a"), "\"\"");
+    check_text("string/escapes", look("a = \"a\\tb\\nc\"\n", "a"), "\"a\\tb\\nc\"");
+    check_text("string/quote", look("a = \"say \\\"hi\\\"\"\n", "a"), "\"say \\\"hi\\\"\"");
+    check_text("string/backslash", look("a = \"a\\\\b\"\n", "a"), "\"a\\\\b\"");
+    check_text("string/unicode", look("a = \"héllo — ünïcode\"\n", "a"), "\"héllo — ünïcode\"");
+    // A literal string keeps its characters as written: a backslash is a
+    // backslash, and a quote needs no escape. The text is what a basic
+    // string of the same characters would hold.
+    check_text("string/literal", look("a = 'C:\\Users'\n", "a"), "\"C:\\\\Users\"");
+    check_text("string/literal quotes", look("a = 'no \"escape\" here'\n", "a"), "\"no \\\"escape\\\" here\"");
+    check_text("string/multiline", look("a = \"\"\"\none\ntwo\"\"\"\n", "a"), "\"one\\ntwo\"");
+    // Only the newline straight after the opening delimiter goes; every
+    // other space stays, which is what the specification says.
+    check_text("string/multiline first newline", look("a = \"\"\"\none\ntwo\"\"\"\n", "a"), "\"one\\ntwo\"");
+    check_text("string/multiline keeps spaces", look("a = \"\"\"\n  one\n  \"\"\"\n", "a"), "\"  one\\n  \"");
+    check_text("string/multiline literal", look("a = '''\none\ntwo'''\n", "a"), "\"one\\ntwo\"");
+    check_text("string/continuation", look("a = \"\"\"one \\\n     two\"\"\"\n", "a"), "\"one two\"");
+
+    // ─── Integers ─────────────────────────────────────────────────────
+    check_text("int/zero", look("a = 0\n", "a"), "0");
+    check_text("int/plus", look("a = +99\n", "a"), "99");
+    check_text("int/minus", look("a = -17\n", "a"), "-17");
+    check_text("int/underscores", look("a = 1_000_000\n", "a"), "1000000");
+    check_text("int/hex", look("a = 0xDEADBEEF\n", "a"), "3735928559");
+    check_text("int/octal", look("a = 0o755\n", "a"), "493");
+    check_text("int/binary", look("a = 0b1101_0110\n", "a"), "214");
+    check_text("int/hex negative", look("a = -0x10\n", "a"), "-16");
+    check_text("int/max", look("a = 9223372036854775807\n", "a"), "9223372036854775807");
+    // TOML integers are 64 bits, so this one is out of range.
+    check_text("int/too big", look("a = 9223372036854775808\n", "a"), "parse: invalid value 9223372036854775808, expected a TOML integer, which is 64 bits");
+
+    // ─── Floats ───────────────────────────────────────────────────────
+    check_text("float/whole", look("a = 1.0\n", "a"), "1.0");
+    check_text("float/frac", look("a = 3.1415\n", "a"), "3.1415");
+    check_text("float/exponent", look("a = 5e+22\n", "a"), "5e+22");
+    // A fraction small enough to survive the round trip through a float
+    // exactly; a wider one would only pin the binary approximation.
+    check_text("float/small exponent", look("a = 1.5e-3\n", "a"), "0.0015");
+    check_text("float/underscores", look("a = 1_000.5\n", "a"), "1000.5");
+    check_text("float/plus", look("a = +1.0\n", "a"), "1.0");
+    check_text("float/inf", look("a = inf\n", "a"), "inf");
+    check_text("float/negative inf", look("a = -inf\n", "a"), "-inf");
+    check_text("float/nan", look("a = nan\n", "a"), "nan");
+
+    // ─── Booleans ─────────────────────────────────────────────────────
+    check_text("bool/true", look("a = true\n", "a"), "true");
+    check_text("bool/false", look("a = false\n", "a"), "false");
+
+    // ─── Date-times, kept as the text they were written as ────────────
+    check_text("date/offset", look("a = 1979-05-27T07:32:00Z\n", "a"), "\"1979-05-27T07:32:00Z\"");
+    check_text("date/space", look("a = 1979-05-27 07:32:00\n", "a"), "\"1979-05-27 07:32:00\"");
+    check_text("date/only", look("a = 1979-05-27\n", "a"), "\"1979-05-27\"");
+    check_text("time/offset", look("a = 07:32:00-08:00\n", "a"), "\"07:32:00-08:00\"");
+
+    // ─── What the encoder writes ──────────────────────────────────────
+    check_text("write/struct", doc(to_toml(Point {.x = 1, .y = 2})), "x = 1\ny = 2\n");
+    check_text("write/nested", doc(to_toml(Outer {.title = "t", .items = [Inner {.name = "a", .n = 1}], .tags = ["x", "y"]})),
+        "title = \"t\"\ntags = [\"x\", \"y\"]\n[[items]]\nname = \"a\"\nn = 1\n");
+    check_text("write/kinds", doc(to_toml(Kinds {.s = "a", .n = -1, .f = 1.5, .b = true})),
+        "s = \"a\"\nn = -1\nf = 1.5\nb = true\n");
+    check_text("write/keys quoted", doc(to_toml(Quoted {.a = "", .b = "a\nb", .c = "say \"hi\""})),
+        "a = \"\"\nb = \"a\\nb\"\nc = \"say \\\"hi\\\"\"\n");
+    check_text("write/whole float", doc(to_toml(Kinds {.s = "x", .n = 0, .f = 2.0, .b = false})), "s = \"x\"\nn = 0\nf = 2.0\nb = false\n");
+    // An empty array has no sections to write, so it stays a value: an
+    // array of tables with nothing in it is spelled as an empty array.
+    check_text("write/empty list", doc(to_toml(Outer {.title = "t", .items = [], .tags = []})), "title = \"t\"\nitems = []\ntags = []\n");
+
+    return 0;
+}

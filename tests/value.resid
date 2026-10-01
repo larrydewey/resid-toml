@@ -1,0 +1,118 @@
+// value.resid — the format-neutral Value tree over TOML. Decoding a Value
+// asks the format what comes next (read_peek) and skips what it does not
+// know (read_skip), so this is where the self-describing side of the
+// decoder is exercised.
+//
+// A TOML document is a table, so everything here is read from a table and
+// written back into one.
+
+import "../src/toml.resid";
+import "../../resid-serial/src/value.resid";
+import "check.resid";
+
+// Decode, show, and write it back out again: the same text means the two
+// directions agree.
+Str trip(Str text) {
+    Result(Value, SerialError) r = from_toml(text);
+    if (Err(e) = r) { return "decode: " + error_text(e); }
+    if (Ok(v) = r) { return show_value(v); }
+    return "unreachable";
+}
+
+Str again(Str text) {
+    Result(Value, SerialError) r = from_toml(text);
+    if (Err(e) = r) { return "decode: " + error_text(e); }
+    if (Ok(v) = r) { return hex_text_of(to_toml(v)); }
+    return "unreachable";
+}
+
+// A Value built in code, encoded, decoded and encoded again: the same text
+// both ways. It goes into a table, since a document is a table and a bare
+// value has no spelling at the top of one.
+Bool wire(Str name, Value want) {
+    Result(Str, SerialError) text = to_toml(vstruct("Box", [vfield("v", want)]));
+    if (Err(e) = text) { return check_text(name, "encode: " + error_text(e), "ok"); }
+    return wire_again(name, text, want);
+}
+
+Bool wire_again(Str name, Result(Str, SerialError) text, Value want) {
+    if (Ok(wrote) = text) {
+        Result(Value, SerialError) r = from_toml(wrote);
+        if (Err(e) = r) { return check_text(name, "decode: " + error_text(e), wrote); }
+        if (Ok(got) = r) { return check_text(name, hex_text_of(to_toml(got)), wrote); }
+    }
+    return check_text(name, "unreachable", show_value(want));
+}
+
+Int main() {
+    // What each kind reads as. Everything is a value in the document's
+    // table, since a document has no other shape.
+    check_text("peek/bool", trip("a = true\n"), "{\"a\": true}");
+    check_text("peek/negative", trip("a = -1\n"), "{\"a\": -1}");
+    check_text("peek/big int", trip("a = 9223372036854775807\n"), "{\"a\": 9223372036854775807}");
+    check_text("peek/hex", trip("a = 0x1F\n"), "{\"a\": 31}");
+    check_text("peek/float", trip("a = 1.5\n"), "{\"a\": 1.5}");
+    check_text("peek/inf", trip("a = inf\n"), "{\"a\": inf}");
+    check_text("peek/nan", trip("a = nan\n"), "{\"a\": nan}");
+    check_text("peek/string", trip("a = \"abc\"\n"), "{\"a\": \"abc\"}");
+    check_text("peek/date", trip("a = 1979-05-27\n"), "{\"a\": \"1979-05-27\"}");
+    check_text("peek/array", trip("a = [1, 2, 3]\n"), "{\"a\": [1, 2, 3]}");
+    check_text("peek/array of tables", trip("[[a]]\nn = 1\n[[a]]\nn = 2\n"), "{\"a\": [{\"n\": 1}, {\"n\": 2}]}");
+    check_text("peek/table", trip("a = 1\nb = \"x\"\n"), "{\"a\": 1, \"b\": \"x\"}");
+    check_text("peek/section", trip("[a]\nn = 1\nm = 2\n"), "{\"a\": {\"n\": 1, \"m\": 2}}");
+    check_text("peek/inline table", trip("a = { n = 1 }\n"), "{\"a\": {\"n\": 1}}");
+    check_text("peek/nested", trip("a = [[1, 2], { b = 3 }]\n"), "{\"a\": [[1, 2], {\"b\": 3}]}");
+
+    // Written back out, the same text.
+    check_text("again/scalars", again("a = 1\nb = \"x\"\nc = true\n"), "a = 1\nb = \"x\"\nc = true\n");
+    check_text("again/array", again("a = [1, 2, 3]\n"), "a = [1, 2, 3]\n");
+    check_text("again/table", again("[a]\nn = 1\nm = 2\n"), "[a]\nn = 1\nm = 2\n");
+    check_text("again/array of tables", again("[[a]]\nn = 1\n[[a]]\nn = 2\n"), "[[a]]\nn = 1\n[[a]]\nn = 2\n");
+    check_text("again/inline table", again("a = { n = 1 }\n"), "[a]\nn = 1\n");
+    check_text("again/nested", again("[a]\nn = [1, 2]\n"), "[a]\nn = [1, 2]\n");
+
+    // Values built here, through the encoder and back.
+    wire("value/bool", VBool(false));
+    wire("value/int", VInt(0 - 7));
+    wire("value/uint fits", VUInt(4294967295));
+    check_text("value/uint", hex_text_of(to_toml(vstruct("Box", [vfield("v", VUInt(18446744073709551615))]))),
+        "invalid value 18446744073709551615, expected a TOML integer, which is 64 bits at .v");
+    wire("value/i128 fits", VI128(i128(0) - i128(4294967296)));
+    wire("value/u128 fits", VU128(u128(4294967295)));
+    check_text("value/u128", hex_text_of(to_toml(vstruct("Box", [vfield("v", VU128(u128(18446744073709551615)))]))),
+        "invalid value 18446744073709551615, expected a TOML integer, which is 64 bits at .v");
+    wire("value/float", VFloat(0.1));
+    wire("value/str", VStr("héllo"));
+    // TOML has no null, so None has no spelling and is refused.
+    check_text("value/none", hex_text_of(to_toml(vstruct("Box", [vfield("v", VNone)]))),
+        "None, which TOML has no null for is not supported by this format at .v");
+    check_text("value/bytes", hex_text_of(to_toml(vstruct("Box", [vfield("v", VBytes([0, 1, 255]))]))),
+        "bytes is not supported by this format at .v");
+    wire("value/seq", VSeq([VInt(1), VStr("x"), VBool(true)]));
+    wire("value/empty seq", VSeq([]));
+    wire("value/map", VMap([ventry(VStr("k"), VSeq([]))]));
+    wire("value/struct", vstruct("Pt", [vfield("x", VInt(1)), vfield("y", VInt(2))]));
+    wire("value/unit variant", VUnitVariant(vtag("Shape", 0, "Dot")));
+    wire("value/variant", VVariant(VPayload {.tag = vtag("Shape", 0, "Circle"), .payload = VInt(3)}));
+    check_text("value/unit", hex_text_of(to_toml(vstruct("Box", [vfield("v", VUnit)]))),
+        "a unit value, which TOML has no spelling for is not supported by this format at .v");
+    // A variant as a field of a table is a table in braces, since a value
+    // needs no section of its own.
+    wire("value/variant field", vstruct("Box", [vfield("k", VUnitVariant(vtag("Shape", 0, "Dot")))]));
+    wire("value/nested", VSeq([VSome(VMap([ventry(VStr("k"), VUnitVariant(vtag("E", 0, "None")))]))]));
+
+    // A table is the only shape a document has, so a bare value has
+    // nowhere to go.
+    check_text("value/bare int", hex_text_of(to_toml(VInt(1))),
+        "a TOML document, whose top level is a table is not supported by this format");
+    check_text("value/bare seq", hex_text_of(to_toml(VSeq([VInt(1)]))),
+        "a TOML document, whose top level is a table is not supported by this format");
+    check_text("value/bare empty seq", hex_text_of(to_toml(VSeq([]))),
+        "a TOML document, whose top level is a table is not supported by this format");
+    // An empty table is a document with nothing in it, which is the one
+    // bare value TOML can spell.
+    check_text("value/bare empty map", hex_text_of(to_toml(VMap([]))), "");
+    check_text("value/bare empty map back", trip(""), "{}");
+
+    return 0;
+}

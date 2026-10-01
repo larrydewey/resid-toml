@@ -1,0 +1,47 @@
+ok   peek/bool
+ok   peek/negative
+ok   peek/big int
+ok   peek/hex
+ok   peek/float
+ok   peek/inf
+ok   peek/nan
+ok   peek/string
+ok   peek/date
+ok   peek/array
+ok   peek/array of tables
+ok   peek/table
+ok   peek/section
+ok   peek/inline table
+ok   peek/nested
+ok   again/scalars
+ok   again/array
+ok   again/table
+ok   again/array of tables
+ok   again/inline table
+ok   again/nested
+ok   value/bool
+ok   value/int
+ok   value/uint fits
+ok   value/uint
+ok   value/i128 fits
+ok   value/u128 fits
+ok   value/u128
+ok   value/float
+ok   value/str
+ok   value/none
+ok   value/bytes
+ok   value/seq
+ok   value/empty seq
+ok   value/map
+ok   value/struct
+ok   value/unit variant
+ok   value/variant
+ok   value/unit
+ok   value/variant field
+ok   value/nested
+ok   value/bare int
+ok   value/bare seq
+ok   value/bare empty seq
+ok   value/bare empty map
+ok   value/bare empty map back
+exit 0
