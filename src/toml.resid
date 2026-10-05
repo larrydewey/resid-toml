@@ -39,7 +39,7 @@
 //   a date-time     a string, since the data model has no date: the text is
 //                   kept as written and reads back the same
 
-import "../../resid-serial/src/serial.resid";
+import "resid-serial/serial.resid";
 import "text.resid";
 import "parse.resid";
 

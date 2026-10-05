@@ -9,7 +9,7 @@
 // way in: a date-time is a string, since the data model has no date, and
 // an integer stays an integer rather than becoming a float.
 
-import "../../resid-serial/src/serial.resid";
+import "resid-serial/serial.resid";
 import "text.resid";
 
 // ─── Small helpers ───────────────────────────────────────────────────

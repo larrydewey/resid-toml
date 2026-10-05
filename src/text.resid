@@ -1,7 +1,7 @@
 // text.resid — the text-level pieces of TOML: character classes, key and
 // string quoting, and number rendering. Both directions, no format state.
 
-import "../../resid-serial/src/serial.resid";
+import "resid-serial/serial.resid";
 
 // ─── Characters ──────────────────────────────────────────────────────
 
