@@ -1,6 +1,7 @@
 [package]
 name = "resid-toml"
 version = "0.1.0"
+license = "MIT"
 root = "src/toml.resid"
 
 # The package is pure: no capabilities. The tests only print.

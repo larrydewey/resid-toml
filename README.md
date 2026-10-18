@@ -132,3 +132,7 @@ manifest tool (`resid-manifest build resid.toml residc`), or pass
 `residc` the dependency map it writes (`resid-manifest depmap resid.toml
 deps.txt`, then `residc file.resid -depmap deps.txt`). `./install.sh` in
 the Resid checkout installs `resid-manifest` beside `residc`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
